@@ -134,6 +134,26 @@ $env:MK_SAMPLE_BYTES = "512000"
 node download.mjs "https://maktabkhooneh.org/course/<slug>/" 
 ```
 
+## 🎯 دانلود انتخابی (فصل/قسمت)
+می‌توانید دانلود را محدود کنید به فصل یا قسمت‌های مشخص:
+
+```bash
+# فقط فصل 2
+node download.mjs "https://maktabkhooneh.org/course/<slug>/" --chapter 2
+
+# فصل 2 و فقط قسمت‌های 2 تا 5 و 9
+node download.mjs "https://maktabkhooneh.org/course/<slug>/" --chapter 2 --lesson 2-5,9
+
+# چند فصل
+node download.mjs "https://maktabkhooneh.org/course/<slug>/" --chapter 1,3
+```
+
+فرمت معتبر برای `--chapter` و `--lesson`:
+- عدد تکی: `2`
+- لیست: `1,3,7`
+- بازه: `2-5`
+- ترکیبی: `2-5,9`
+
 ## ♻️ Retry و Timeout
 به صورت پیش‌فرض، ابزار برای خطاهای موقت شبکه، timeout و خطاهای 5xx با **Exponential Backoff** دوباره تلاش می‌کند.
 

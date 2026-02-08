@@ -206,6 +206,8 @@ function printUsage() {
     console.log('\n' + paintBold('Options:'));
     console.log(`  ${paintYellow('<course_url>')}                The maktabkhooneh course URL (e.g., https://maktabkhooneh.org/course/<slug>/)`);
     console.log(`  ${paintGreen('--sample-bytes')} ${paintYellow('N')}            Download only the first N bytes of each video (also via env MK_SAMPLE_BYTES)`);
+    console.log(`  ${paintGreen('--chapter')} ${paintYellow('SPEC')}           Select chapter(s): e.g. 2 or 1,3 or 2-4`);
+    console.log(`  ${paintGreen('--lesson')} ${paintYellow('SPEC')}            Select lesson(s) inside selected chapter(s): e.g. 2 or 2-5,9`);
     console.log(`  ${paintGreen('--session-file')} ${paintYellow('<FILE>')}       Session store path (default: session.json, multi-user)`);
     console.log(`  ${paintGreen('--force-login')}               Force fresh login even if stored session is valid`);
     console.log(`  ${paintGreen('--verbose')} | ${paintGreen('-v')}              Verbose debug / HTTP flow info`);
@@ -222,9 +224,32 @@ function printUsage() {
     console.log('\n' + paintBold('Examples:'));
     console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/"'));
     console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/" --sample-bytes 65536 --verbose'));
+    console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/" --chapter 2 --lesson 2-5,9'));
     console.log('  ' + paintCyan('MK_EMAIL="you@example.com" MK_PASSWORD="Secret123" node download.mjs "https://maktabkhooneh.org/course/<slug>/"'));
     console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/" --force-login'));
     console.log('');
+}
+
+function parseNumberSpec(spec) {
+    if (!spec || !String(spec).trim()) return null;
+    const out = new Set();
+    const parts = String(spec).split(',').map(s => s.trim()).filter(Boolean);
+    for (const p of parts) {
+        const m = p.match(/^(\d+)\s*-\s*(\d+)$/);
+        if (m) {
+            const a = parseInt(m[1], 10);
+            const b = parseInt(m[2], 10);
+            if (a <= 0 || b <= 0) throw new Error(`Invalid range: ${p}`);
+            const [start, end] = a <= b ? [a, b] : [b, a];
+            for (let i = start; i <= end; i++) out.add(i);
+            continue;
+        }
+        if (!/^\d+$/.test(p)) throw new Error(`Invalid number token: ${p}`);
+        const n = parseInt(p, 10);
+        if (n <= 0) throw new Error(`Invalid number: ${p}`);
+        out.add(n);
+    }
+    return out;
 }
 
 function parseCLI() {
@@ -232,6 +257,8 @@ function parseCLI() {
     let inputCourseUrl = null;
     let sampleBytesToDownload = DEFAULT_SAMPLE_BYTES;
     let isVerboseLoggingEnabled = false;
+    let chapterSpec = null;
+    let lessonSpec = null;
     let sessionFile = 'session.json';
     let forceLogin = false;
     for (let i = 0; i < args.length; i++) {
@@ -249,6 +276,14 @@ function parseCLI() {
         } else if (a === '--sample-bytes') {
             const v = args[i + 1];
             if (v) { sampleBytesToDownload = parseInt(v, 10) || 0; i++; }
+        } else if (a === '--chapter') {
+            const v = args[i + 1]; if (v) { chapterSpec = v; i++; }
+        } else if (a.startsWith('--chapter=')) {
+            chapterSpec = a.split('=')[1];
+        } else if (a === '--lesson') {
+            const v = args[i + 1]; if (v) { lessonSpec = v; i++; }
+        } else if (a.startsWith('--lesson=')) {
+            lessonSpec = a.split('=')[1];
         } else if (a === '--verbose' || a === '-v') {
             isVerboseLoggingEnabled = true;
         } else if (a === '--force-login') {
@@ -260,8 +295,10 @@ function parseCLI() {
     if (!sampleBytesToDownload && process.env.MK_SAMPLE_BYTES) {
         sampleBytesToDownload = parseInt(process.env.MK_SAMPLE_BYTES, 10) || 0;
     }
+    const selectedChapters = parseNumberSpec(chapterSpec);
+    const selectedLessons = parseNumberSpec(lessonSpec);
     return {
-        inputCourseUrl, sampleBytesToDownload, isVerboseLoggingEnabled, sessionFile, forceLogin
+        inputCourseUrl, sampleBytesToDownload, isVerboseLoggingEnabled, sessionFile, forceLogin, selectedChapters, selectedLessons
     };
 }
 
@@ -1011,7 +1048,7 @@ async function downloadToFile(url, filePath, referer, maxRetries = RUNTIME_CONFI
 
 async function main() {
     const {
-        inputCourseUrl, sampleBytesToDownload, isVerboseLoggingEnabled, sessionFile, forceLogin
+        inputCourseUrl, sampleBytesToDownload, isVerboseLoggingEnabled, sessionFile, forceLogin, selectedChapters, selectedLessons
     } = parseCLI();
     const userEmail = LOGIN_EMAIL || null;
     const userPassword = LOGIN_PASSWORD || null;
@@ -1048,6 +1085,12 @@ async function main() {
     if (sampleBytesToDownload && sampleBytesToDownload > 0) {
         console.log(`🎯 Sample mode: downloading first ${paintBold(String(sampleBytesToDownload))} bytes of each video (saved as .sample.mp4)`);
     }
+    if (selectedChapters) {
+        console.log(`🧭 Chapter filter: ${paintCyan(Array.from(selectedChapters).sort((a, b) => a - b).join(', '))}`);
+    }
+    if (selectedLessons) {
+        console.log(`🧭 Lesson filter: ${paintCyan(Array.from(selectedLessons).sort((a, b) => a - b).join(', '))}`);
+    }
 
     // Fetch chapters
     verbose(paintCyan('Fetching chapters...'));
@@ -1061,16 +1104,20 @@ async function main() {
         for (let chapterIndex = 0; chapterIndex < chapters.length; chapterIndex++) {
             const chapter = chapters[chapterIndex];
             const chapterNo = chapterIndex + 1;
+            if (selectedChapters && !selectedChapters.has(chapterNo)) continue;
             const chapterFolder = path.join(outputRootFolder, `فصل ${chapterNo} - ${sanitizeName(chapter.title || chapter.slug || 'chapter')}`);
             console.log(`📖 Chapter ${chapterIndex + 1}/${chapters.length}: ${paintBold(chapter.title || chapter.slug)}`);
 
             const units = Array.isArray(chapter.unit_set) ? chapter.unit_set : [];
+            let chapterLectureNo = 0;
             for (let unitIndex = 0; unitIndex < units.length; unitIndex++) {
                 const unit = units[unitIndex];
                 if (!unit?.status) continue; // inactive
                 if (unit?.type !== 'lecture') { nonLectureUnits++; continue; } // skip non-video units
+                chapterLectureNo++;
+                if (selectedLessons && !selectedLessons.has(chapterLectureNo)) continue;
                 totalUnits++;
-                const unitNo = unitIndex + 1;
+                const unitNo = chapterLectureNo;
                 const baseFileName = `قسمت ${unitNo} - ${sanitizeName(unit.title || unit.slug || 'lecture')}.mp4`;
                 const finalFileName = (sampleBytesToDownload && sampleBytesToDownload > 0)
                     ? baseFileName.replace(/\.mp4$/i, '.sample.mp4')
@@ -1188,4 +1235,12 @@ async function main() {
     }
 }
 
-main().catch(err => { logError('Fatal:', err); process.exit(1); });
+main().catch(err => {
+    if (/Invalid (range|number token|number)/.test(String(err?.message || ''))) {
+        logError(`Invalid --chapter/--lesson format: ${err.message}`);
+        logInfo('Examples: --chapter 2  |  --chapter 1,3  |  --chapter 2-4  |  --lesson 2-5,9');
+        process.exit(2);
+    }
+    logError('Fatal:', err);
+    process.exit(1);
+});
