@@ -2,7 +2,7 @@
  * CLI tool to download all lecture videos of a maktabkhooneh course
  * 
  * Usage examples:
- *   node download.mjs "https://maktabkhooneh.org/course/<slug>/" --user you@example.com --pass "Secret123"
+ *   node download.mjs "https://maktabkhooneh.org/course/<slug>/"
  *   node download.mjs "https://maktabkhooneh.org/course/<slug>/" --sample-bytes 65536 --verbose
  * 
  * Notes: Only download content you have legal rights to access.
@@ -46,9 +46,82 @@ const logSuccess = (...a) => console.log('✅', ...a);
 const logWarn = (...a) => console.warn('⚠️', ...a);
 const logError = (...a) => console.error('❌', ...a);
 
+function loadDotEnvFile(filePath = path.resolve(process.cwd(), '.env')) {
+    try {
+        if (!fs.existsSync(filePath)) return;
+        const text = fs.readFileSync(filePath, 'utf8');
+        for (const line of text.split(/\r?\n/)) {
+            const t = line.trim();
+            if (!t || t.startsWith('#')) continue;
+            const eq = t.indexOf('=');
+            if (eq <= 0) continue;
+            const key = t.slice(0, eq).trim();
+            let val = t.slice(eq + 1).trim();
+            if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+                val = val.slice(1, -1);
+            }
+            if (key && process.env[key] == null) process.env[key] = val;
+        }
+    } catch { }
+}
+
+loadDotEnvFile();
+
 // ===============
 // Configuration
 // ===============
+const DEFAULT_RETRY_ATTEMPTS = 4;
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const DEFAULT_READ_TIMEOUT_MS = 120_000;
+
+function parsePositiveInt(value, fallback) {
+    const n = Number.parseInt(String(value ?? ''), 10);
+    return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function toBackoffMs(attempt) {
+    return Math.min(30_000, 700 * (2 ** Math.max(0, attempt - 1)));
+}
+
+function isRetriableStatus(status) {
+    return status === 408 || status === 425 || status === 429 || (status >= 500 && status <= 599);
+}
+
+function isTimeoutError(err) {
+    const m = String(err?.message || '').toLowerCase();
+    return err?.name === 'AbortError' || m.includes('timeout') || m.includes('timed out');
+}
+
+function isRetriableNetworkError(err) {
+    if (isTimeoutError(err)) return true;
+    const c = String(err?.cause?.code || '').toUpperCase();
+    return ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE', 'ENOTFOUND', 'EHOSTUNREACH', 'EAI_AGAIN'].includes(c);
+}
+
+function explainHttpFailure(status, context = 'request') {
+    if (status === 401) {
+        return `${context} failed with 401 Unauthorized. Login session is invalid/expired. Re-login with MK_EMAIL/MK_PASSWORD or refresh MK_COOKIE.`;
+    }
+    if (status === 403) {
+        return `${context} failed with 403 Forbidden. You do not have access to this content/course, or your cookie is rejected.`;
+    }
+    if (status === 429) {
+        return `${context} failed with 429 Too Many Requests. Reduce request rate and retry later.`;
+    }
+    if (status >= 500) {
+        return `${context} failed with ${status}. Server-side temporary error.`;
+    }
+    return `${context} failed with HTTP ${status}.`;
+}
+
+const RUNTIME_CONFIG = {
+    retryAttempts: parsePositiveInt(process.env.MK_RETRY_ATTEMPTS, DEFAULT_RETRY_ATTEMPTS),
+    requestTimeoutMs: parsePositiveInt(process.env.MK_REQUEST_TIMEOUT_MS ?? process.env.MK_REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT_MS),
+    readTimeoutMs: parsePositiveInt(process.env.MK_READ_TIMEOUT_MS ?? process.env.MK_READ_TIMEOUT, DEFAULT_READ_TIMEOUT_MS)
+};
+const LOGIN_EMAIL = (process.env.MK_EMAIL || '').trim();
+const LOGIN_PASSWORD = (process.env.MK_PASSWORD || '').trim();
+
 // Cookie: read from env MK_COOKIE or file path in MK_COOKIE_FILE; fallback to placeholder.
 const COOKIE = (() => {
     if (process.env.MK_COOKIE && process.env.MK_COOKIE.trim()) return process.env.MK_COOKIE.trim();
@@ -111,7 +184,7 @@ function buildProgressBar(ratio, width = 24) {
 
 function ensureCookiePresent() {
     if (!(ACTIVE_COOKIE && ACTIVE_COOKIE !== 'PUT_YOUR_COOKIE_HERE') && !(COOKIE && COOKIE !== 'PUT_YOUR_COOKIE_HERE')) {
-        logError('No active session. Provide --user / --pass to login or set MK_COOKIE / MK_COOKIE_FILE.');
+        logError('No active session. Set MK_EMAIL/MK_PASSWORD (or MK_COOKIE / MK_COOKIE_FILE).');
         process.exit(1);
     }
 }
@@ -133,22 +206,24 @@ function printUsage() {
     console.log('\n' + paintBold('Options:'));
     console.log(`  ${paintYellow('<course_url>')}                The maktabkhooneh course URL (e.g., https://maktabkhooneh.org/course/<slug>/)`);
     console.log(`  ${paintGreen('--sample-bytes')} ${paintYellow('N')}            Download only the first N bytes of each video (also via env MK_SAMPLE_BYTES)`);
-    console.log(`  ${paintGreen('--user')} | ${paintGreen('--email')} ${paintYellow('<EMAIL>')}    Login with email (stores cookie in session file)`);
-    console.log(`  ${paintGreen('--pass')} | ${paintGreen('--password')} ${paintYellow('<PASS>')}  Password for login (consider quoting)`);
     console.log(`  ${paintGreen('--session-file')} ${paintYellow('<FILE>')}       Session store path (default: session.json, multi-user)`);
     console.log(`  ${paintGreen('--force-login')}               Force fresh login even if stored session is valid`);
     console.log(`  ${paintGreen('--verbose')} | ${paintGreen('-v')}              Verbose debug / HTTP flow info`);
     console.log(`  ${paintGreen('--help')} | ${paintGreen('-h')}                 Show this help and exit`);
     console.log('\n' + paintBold('Env vars:'));
     console.log(`    MK_COOKIE / MK_COOKIE_FILE   Override cookie manually (bypass credential login)`);
+    console.log(`    MK_EMAIL / MK_PASSWORD       Login credentials (read from env or .env)`);
     console.log(`    MK_SAMPLE_BYTES              Default sample bytes (overridden by --sample-bytes)`);
+    console.log(`    MK_RETRY_ATTEMPTS            Retry attempts for transient failures`);
+    console.log(`    MK_REQUEST_TIMEOUT_MS        Request timeout in ms (or MK_REQUEST_TIMEOUT)`);
+    console.log(`    MK_READ_TIMEOUT_MS           Read timeout in ms (or MK_READ_TIMEOUT)`);
 
     // Examples
     console.log('\n' + paintBold('Examples:'));
     console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/"'));
     console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/" --sample-bytes 65536 --verbose'));
-    console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/" --user you@example.com --pass "Secret123"'));
-    console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/" --user you@example.com --pass "Secret123" --force-login'));
+    console.log('  ' + paintCyan('MK_EMAIL="you@example.com" MK_PASSWORD="Secret123" node download.mjs "https://maktabkhooneh.org/course/<slug>/"'));
+    console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/" --force-login'));
     console.log('');
 }
 
@@ -157,8 +232,6 @@ function parseCLI() {
     let inputCourseUrl = null;
     let sampleBytesToDownload = DEFAULT_SAMPLE_BYTES;
     let isVerboseLoggingEnabled = false;
-    let userEmail = null;
-    let userPassword = null;
     let sessionFile = 'session.json';
     let forceLogin = false;
     for (let i = 0; i < args.length; i++) {
@@ -166,14 +239,6 @@ function parseCLI() {
         if (a === '--help' || a === '-h') {
             printUsage();
             process.exit(0);
-        } else if (a === '--user' || a === '--email') {
-            const v = args[i + 1]; if (v) { userEmail = v; i++; }
-        } else if (a.startsWith('--user=')) {
-            userEmail = a.split('=')[1];
-        } else if (a === '--pass' || a === '--password') {
-            const v = args[i + 1]; if (v) { userPassword = v; i++; }
-        } else if (a.startsWith('--pass=')) {
-            userPassword = a.split('=')[1];
         } else if (a === '--session-file') {
             const v = args[i + 1]; if (v) { sessionFile = v; i++; }
         } else if (a.startsWith('--session-file=')) {
@@ -195,7 +260,9 @@ function parseCLI() {
     if (!sampleBytesToDownload && process.env.MK_SAMPLE_BYTES) {
         sampleBytesToDownload = parseInt(process.env.MK_SAMPLE_BYTES, 10) || 0;
     }
-    return { inputCourseUrl, sampleBytesToDownload, isVerboseLoggingEnabled, userEmail, userPassword, sessionFile, forceLogin };
+    return {
+        inputCourseUrl, sampleBytesToDownload, isVerboseLoggingEnabled, sessionFile, forceLogin
+    };
 }
 
 function createVerboseLogger(isVerbose) {
@@ -230,13 +297,37 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 60_000) {
     }
 }
 
+async function fetchWithRetry(url, options = {}, { retries = RUNTIME_CONFIG.retryAttempts, timeoutMs = RUNTIME_CONFIG.requestTimeoutMs, onRetry } = {}) {
+    let lastErr = null;
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        try {
+            const res = await fetchWithTimeout(url, options, timeoutMs);
+            if (isRetriableStatus(res.status) && attempt < retries) {
+                if (typeof onRetry === 'function') onRetry({ attempt, retries, reason: `HTTP ${res.status}` });
+                await sleep(toBackoffMs(attempt));
+                continue;
+            }
+            return res;
+        } catch (err) {
+            lastErr = err;
+            if (attempt < retries && isRetriableNetworkError(err)) {
+                if (typeof onRetry === 'function') onRetry({ attempt, retries, reason: err.message || String(err) });
+                await sleep(toBackoffMs(attempt));
+                continue;
+            }
+            throw err;
+        }
+    }
+    throw lastErr || new Error('Request failed after retries');
+}
+
 function ensureTrailingSlash(u) { return u.endsWith('/') ? u : u + '/'; }
 
 // Try to detect remote file size and whether server supports Range
 async function getRemoteSizeAndRanges(url, referer) {
     // HEAD first
     try {
-        const res = await fetchWithTimeout(url, { method: 'HEAD', headers: { ...commonHeaders(referer), accept: '*/*' } }, 20_000);
+        const res = await fetchWithRetry(url, { method: 'HEAD', headers: { ...commonHeaders(referer), accept: '*/*' } }, { retries: RUNTIME_CONFIG.retryAttempts, timeoutMs: RUNTIME_CONFIG.requestTimeoutMs });
         if (res.ok) {
             const len = res.headers.get('content-length');
             const size = len ? parseInt(len, 10) : undefined;
@@ -246,7 +337,7 @@ async function getRemoteSizeAndRanges(url, referer) {
     } catch { }
     // Fallback: GET single byte
     try {
-        const res = await fetchWithTimeout(url, { method: 'GET', headers: { ...commonHeaders(referer), range: 'bytes=0-0', accept: '*/*' } }, 20_000);
+        const res = await fetchWithRetry(url, { method: 'GET', headers: { ...commonHeaders(referer), range: 'bytes=0-0', accept: '*/*' } }, { retries: RUNTIME_CONFIG.retryAttempts, timeoutMs: RUNTIME_CONFIG.requestTimeoutMs });
         if (res.status === 206) {
             const cr = res.headers.get('content-range');
             // e.g. bytes 0-0/123456
@@ -262,16 +353,16 @@ async function getRemoteSizeAndRanges(url, referer) {
 // API: fetch chapters JSON for a course.
 async function fetchChapters(courseSlug, referer) {
     const apiUrl = `${ORIGIN}/api/v1/courses/${courseSlug}/chapters/`;
-    const res = await fetchWithTimeout(apiUrl, { method: 'GET', headers: { ...commonHeaders(referer), accept: 'application/json' } });
-    if (!res.ok) throw new Error(`Failed to fetch chapters: ${res.status} ${res.statusText}`);
+    const res = await fetchWithRetry(apiUrl, { method: 'GET', headers: { ...commonHeaders(referer), accept: 'application/json' } });
+    if (!res.ok) throw new Error(explainHttpFailure(res.status, 'Fetch chapters'));
     return res.json();
 }
 
 // API: core-data to verify authentication and basic profile.
 async function fetchCoreData(referer) {
     const url = `${ORIGIN}/api/v1/general/core-data/?profile=1`;
-    const res = await fetchWithTimeout(url, { method: 'GET', headers: { ...commonHeaders(referer || ORIGIN), accept: 'application/json' } }, 30_000);
-    if (!res.ok) throw new Error(`Core-data request failed: ${res.status} ${res.statusText}`);
+    const res = await fetchWithRetry(url, { method: 'GET', headers: { ...commonHeaders(referer || ORIGIN), accept: 'application/json' } });
+    if (!res.ok) throw new Error(explainHttpFailure(res.status, 'Auth check (core-data)'));
     return res.json();
 }
 
@@ -334,6 +425,15 @@ function sanitizeName(name) {
     return name.replace(/[\/:*?"<>|]/g, ' ').replace(/[\s\u200c\u200f\u202a\u202b]+/g, ' ').trim().slice(0, 150);
 }
 
+function normalizeCourseFolderNameFromSlug(courseSlug) {
+    const decoded = decodeURIComponent(courseSlug || '');
+    // Remove trailing course id token like "-mk748" / "-MK12345"
+    const withoutMkId = decoded.replace(/-mk\d+\s*$/i, '');
+    // Replace slug separators with spaces for cleaner folder names
+    const spaced = withoutMkId.replace(/[-_]+/g, ' ');
+    return sanitizeName(spaced);
+}
+
 // Extract attachment links from lecture HTML.
 function extractAttachmentLinks(html) {
     const results = new Set();
@@ -393,7 +493,7 @@ async function writeSessionFileMulti(file, email, cookie, existing) {
 }
 
 async function fetchJson(url, referer) {
-    const res = await fetchWithTimeout(url, { headers: { ...commonHeaders(referer), accept: 'application/json' } }, 30_000);
+    const res = await fetchWithRetry(url, { headers: { ...commonHeaders(referer), accept: 'application/json' } });
     const text = await res.text();
     let json = null; try { json = JSON.parse(text); } catch { }
     return { res, text, json };
@@ -445,6 +545,7 @@ function rawRequest(urlStr, { method = 'GET', headers = {}, body = null } = {}) 
         };
         const req = https.request(opts, (res) => {
             const chunks = [];
+            res.setTimeout(RUNTIME_CONFIG.readTimeoutMs, () => req.destroy(new Error(`Read timeout after ${RUNTIME_CONFIG.readTimeoutMs}ms`)));
             res.on('data', c => chunks.push(c));
             res.on('end', () => {
                 resolve({
@@ -454,10 +555,35 @@ function rawRequest(urlStr, { method = 'GET', headers = {}, body = null } = {}) 
                 });
             });
         });
+        req.setTimeout(RUNTIME_CONFIG.requestTimeoutMs, () => req.destroy(new Error(`Request timeout after ${RUNTIME_CONFIG.requestTimeoutMs}ms`)));
         req.on('error', reject);
         if (body) req.write(body);
         req.end();
     });
+}
+
+async function rawRequestWithRetry(urlStr, reqOpts = {}, verbose = () => { }) {
+    let lastErr = null;
+    for (let attempt = 1; attempt <= RUNTIME_CONFIG.retryAttempts; attempt++) {
+        try {
+            const r = await rawRequest(urlStr, reqOpts);
+            if (isRetriableStatus(r.status) && attempt < RUNTIME_CONFIG.retryAttempts) {
+                verbose(`[retry] ${reqOpts.method || 'GET'} ${urlStr} -> HTTP ${r.status} (attempt ${attempt}/${RUNTIME_CONFIG.retryAttempts})`);
+                await sleep(toBackoffMs(attempt));
+                continue;
+            }
+            return r;
+        } catch (err) {
+            lastErr = err;
+            if (attempt < RUNTIME_CONFIG.retryAttempts && isRetriableNetworkError(err)) {
+                verbose(`[retry] ${reqOpts.method || 'GET'} ${urlStr} -> ${err.message} (attempt ${attempt}/${RUNTIME_CONFIG.retryAttempts})`);
+                await sleep(toBackoffMs(attempt));
+                continue;
+            }
+            throw err;
+        }
+    }
+    throw lastErr || new Error('Raw request failed after retries');
 }
 
 async function loginWithCredentialsInline(email, password, verbose = () => { }) {
@@ -468,21 +594,21 @@ async function loginWithCredentialsInline(email, password, verbose = () => { }) 
     const dbg = (...a) => verbose('[login]', ...a);
 
     // 0. Visit login page to obtain initial csrftoken cookie
-    let r = await rawRequest(`${ORIGIN}/accounts/login/`, {
+    let r = await rawRequestWithRetry(`${ORIGIN}/accounts/login/`, {
         method: 'GET',
         headers: {
             'User-Agent': UA,
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
         }
-    });
+    }, verbose);
     store.applySetCookie(r.headers['set-cookie']);
     let csrf = store.get('csrftoken') || null;
     if (!csrf) {
         // 0b. fallback: core-data json endpoint (sometimes returns csrf in body)
-        const r2 = await rawRequest(`${ORIGIN}/api/v1/general/core-data/?profile=1`, {
+        const r2 = await rawRequestWithRetry(`${ORIGIN}/api/v1/general/core-data/?profile=1`, {
             method: 'GET',
             headers: { 'User-Agent': UA, 'Accept': 'application/json' }
-        });
+        }, verbose);
         store.applySetCookie(r2.headers['set-cookie']);
         try { const j2 = JSON.parse(r2.body); csrf = csrf || j2?.auth?.csrf || null; } catch { }
         if (!csrf) csrf = store.get('csrftoken') || null;
@@ -510,7 +636,7 @@ async function loginWithCredentialsInline(email, password, verbose = () => { }) 
     formCheck.append('tessera', email);
     // recaptcha sometimes optional; keep param but empty to mimic browser before token set
     formCheck.append('g-recaptcha-response', '');
-    r = await rawRequest(`${ORIGIN}/api/v1/auth/check-active-user`, {
+    r = await rawRequestWithRetry(`${ORIGIN}/api/v1/auth/check-active-user`, {
         method: 'POST',
         headers: addCsrfHeaders({
             ...baseHeaders(),
@@ -518,8 +644,11 @@ async function loginWithCredentialsInline(email, password, verbose = () => { }) 
             'Cookie': cookieHeader()
         }),
         body: formCheck.toString()
-    });
+    }, verbose);
     store.applySetCookie(r.headers['set-cookie']);
+    if (r.status < 200 || r.status >= 300) {
+        throw new Error(explainHttpFailure(r.status, 'Login step check-active-user'));
+    }
     let jCheck = null; try { jCheck = JSON.parse(r.body); } catch { }
     if (!jCheck) {
         dbg('check-active-user raw body:', r.body.slice(0, 300));
@@ -542,7 +671,7 @@ async function loginWithCredentialsInline(email, password, verbose = () => { }) 
     formLogin.append('hidden_username', email);
     formLogin.append('password', password);
     formLogin.append('g-recaptcha-response', '');
-    r = await rawRequest(`${ORIGIN}/api/v1/auth/login-authentication`, {
+    r = await rawRequestWithRetry(`${ORIGIN}/api/v1/auth/login-authentication`, {
         method: 'POST',
         headers: addCsrfHeaders({
             ...baseHeaders(),
@@ -550,8 +679,11 @@ async function loginWithCredentialsInline(email, password, verbose = () => { }) 
             'Cookie': cookieHeader()
         }),
         body: formLogin.toString()
-    });
+    }, verbose);
     store.applySetCookie(r.headers['set-cookie']);
+    if (r.status < 200 || r.status >= 300) {
+        throw new Error(explainHttpFailure(r.status, 'Login step login-authentication'));
+    }
     let jLogin = null; try { jLogin = JSON.parse(r.body); } catch { }
     if (!jLogin) {
         dbg('login-authentication raw body:', r.body.slice(0, 300));
@@ -582,8 +714,8 @@ async function prepareSession({ userEmail, userPassword, sessionFile, verbose, c
                 logInfo('Session valid' + (userEmail ? ` (user: ${userEmail})` : ''));
                 return core;
             }
-            logWarn('Stored session not authenticated');
-            return null;
+                logWarn('Stored session is expired/invalid (not authenticated).');
+                return null;
         } catch (e) {
             verbose('Verify failed: ' + e.message);
             return null;
@@ -652,7 +784,7 @@ async function prepareSession({ userEmail, userPassword, sessionFile, verbose, c
 
     // 4. If we reach here, maybe we still have ACTIVE_COOKIE but verification failed or no cookie
     if (!ACTIVE_COOKIE) {
-        logWarn('No usable session found. Provide --user and --pass to create one.');
+        logWarn('No usable session found. Set MK_EMAIL and MK_PASSWORD to create one.');
     }
     return { core: null, source: 'none' };
 }
@@ -695,7 +827,7 @@ class ByteLimit extends Transform {
 
 // Download a URL to a file (with retries). If sampleBytes > 0, request a Range and also enforce a local limit.
 // label: optional display name to show in the progress line (e.g., final file name)
-async function downloadToFile(url, filePath, referer, maxRetries = 3, sampleBytes = 0, label = '') {
+async function downloadToFile(url, filePath, referer, maxRetries = RUNTIME_CONFIG.retryAttempts, sampleBytes = 0, label = '') {
     // Skip if already exists with non-zero size
     let existingFinalSize = 0;
     try { const stat = fs.statSync(filePath); existingFinalSize = stat.size; if (existingFinalSize > 0 && sampleBytes > 0) return 'exists'; } catch { }
@@ -743,9 +875,9 @@ async function downloadToFile(url, filePath, referer, maxRetries = 3, sampleByte
             }
 
             const controller = new AbortController();
-            const to = setTimeout(() => controller.abort(), 120_000);
+            const to = setTimeout(() => controller.abort(), RUNTIME_CONFIG.requestTimeoutMs);
             const res = await fetch(url, { ...requestInit, signal: controller.signal });
-            if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+            if (!res.ok || !res.body) throw new Error(explainHttpFailure(res.status, 'Download'));
             if (resumeOffset > 0 && res.status !== 206) {
                 // Server didn't honor Range; restart from 0
                 try { await fs.promises.unlink(tmpPath); } catch { }
@@ -757,6 +889,14 @@ async function downloadToFile(url, filePath, referer, maxRetries = 3, sampleByte
             await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
             const write = fs.createWriteStream(writingTo, { flags: (sampleBytes > 0 || resumeOffset === 0) ? 'w' : 'a' });
             const readable = Readable.fromWeb(res.body);
+            let readIdleTimer = null;
+            const resetReadTimeout = () => {
+                if (readIdleTimer) clearTimeout(readIdleTimer);
+                readIdleTimer = setTimeout(() => {
+                    try { controller.abort(); } catch { }
+                }, RUNTIME_CONFIG.readTimeoutMs);
+            };
+            resetReadTimeout();
 
             // Progress bar state
             const contentLengthHeader = res.headers.get('content-length');
@@ -808,6 +948,7 @@ async function downloadToFile(url, filePath, referer, maxRetries = 3, sampleByte
             // Counting transform
             const counter = new Transform({
                 transform(chunk, _enc, cb) {
+                    resetReadTimeout();
                     downloadedBytes += chunk.length;
                     // throttle render slightly by size steps
                     if (downloadedBytes === chunk.length || downloadedBytes % 65536 < 8192) render();
@@ -841,6 +982,7 @@ async function downloadToFile(url, filePath, referer, maxRetries = 3, sampleByte
                 throw pipeErr;
             } finally {
                 clearTimeout(to);
+                if (readIdleTimer) clearTimeout(readIdleTimer);
             }
 
             // finalize progress bar to 100%
@@ -853,12 +995,13 @@ async function downloadToFile(url, filePath, referer, maxRetries = 3, sampleByte
             }
             try { await fs.promises.unlink(tmpPath); } catch { }
             return 'downloaded';
-        } catch (err) {
-            try { process.stdout.write('\n'); } catch { }
-            // Keep .part file for future resume; do not delete on error
-            if (attempt < maxRetries) {
+            } catch (err) {
+                try { process.stdout.write('\n'); } catch { }
+                // Keep .part file for future resume; do not delete on error
+            const retryable = isRetriableNetworkError(err) || /HTTP (408|425|429|5\d\d)/.test(String(err?.message || ''));
+            if (attempt < maxRetries && retryable) {
                 logWarn(`Retry ${attempt}/${maxRetries} for ${path.basename(filePath)} after error: ${err.message}`);
-                await sleep(1000 * attempt);
+                await sleep(toBackoffMs(attempt));
                 continue;
             }
             throw err;
@@ -867,17 +1010,22 @@ async function downloadToFile(url, filePath, referer, maxRetries = 3, sampleByte
 }
 
 async function main() {
-    const { inputCourseUrl, sampleBytesToDownload, isVerboseLoggingEnabled, userEmail, userPassword, sessionFile, forceLogin } = parseCLI();
+    const {
+        inputCourseUrl, sampleBytesToDownload, isVerboseLoggingEnabled, sessionFile, forceLogin
+    } = parseCLI();
+    const userEmail = LOGIN_EMAIL || null;
+    const userPassword = LOGIN_PASSWORD || null;
     const { verbose } = createVerboseLogger(isVerboseLoggingEnabled);
     if (!inputCourseUrl) { printUsage(); process.exit(1); }
+    verbose(`Runtime config => retries=${RUNTIME_CONFIG.retryAttempts}, request-timeout=${RUNTIME_CONFIG.requestTimeoutMs}ms, read-timeout=${RUNTIME_CONFIG.readTimeoutMs}ms`);
     // Attempt to load / create / verify session (may already return core)
     const prep = await prepareSession({ userEmail, userPassword, sessionFile, verbose, courseUrl: inputCourseUrl, forceLogin });
     ensureCookiePresent();
 
     const normalizedCourseUrl = ensureTrailingSlash(inputCourseUrl.trim());
     const courseSlug = extractCourseSlug(normalizedCourseUrl);
-    // Use decoded slug (human-friendly, especially for Persian) for the top-level folder name
-    const courseDisplayName = sanitizeName(decodeURIComponent(courseSlug));
+    // Build a cleaner course folder name: remove trailing mk id and replace dashes with spaces.
+    const courseDisplayName = normalizeCourseFolderNameFromSlug(courseSlug);
     const outputRootFolder = path.resolve(process.cwd(), 'download', courseDisplayName);
     // Ensure base output folder exists
     try { await fs.promises.mkdir(outputRootFolder, { recursive: true }); } catch { }
@@ -893,7 +1041,7 @@ async function main() {
         }
     }
     const ok = printProfileSummary(coreData);
-    if (!ok) { logError('Not logged in. Session invalid. Provide credentials with --user --pass.'); process.exit(1); }
+    if (!ok) { logError('Not logged in. Session invalid. Set MK_EMAIL/MK_PASSWORD or provide a valid cookie.'); process.exit(1); }
 
     console.log(`📚 Course slug: ${paintBold(decodeURIComponent(courseSlug))}`);
     console.log(`📁 Output folder: ${paintCyan(outputRootFolder)}`);
@@ -908,22 +1056,22 @@ async function main() {
     if (chapters.length === 0) { logError('No chapters found. Make sure the URL and cookie are correct.'); process.exit(2); }
 
     // Iterate chapters and units
-    let totalUnits = 0, downloadedCount = 0, skippedCount = 0, failedCount = 0;
+    let totalUnits = 0, downloadedCount = 0, skippedCount = 0, failedCount = 0, nonLectureUnits = 0;
     try {
         for (let chapterIndex = 0; chapterIndex < chapters.length; chapterIndex++) {
             const chapter = chapters[chapterIndex];
-            const chapterOrder = String(chapterIndex + 1).padStart(2, '0');
-            const chapterFolder = path.join(outputRootFolder, `${chapterOrder} - ${sanitizeName(chapter.title || chapter.slug || 'chapter')}`);
+            const chapterNo = chapterIndex + 1;
+            const chapterFolder = path.join(outputRootFolder, `فصل ${chapterNo} - ${sanitizeName(chapter.title || chapter.slug || 'chapter')}`);
             console.log(`📖 Chapter ${chapterIndex + 1}/${chapters.length}: ${paintBold(chapter.title || chapter.slug)}`);
 
             const units = Array.isArray(chapter.unit_set) ? chapter.unit_set : [];
             for (let unitIndex = 0; unitIndex < units.length; unitIndex++) {
                 const unit = units[unitIndex];
                 if (!unit?.status) continue; // inactive
-                if (unit?.type !== 'lecture') continue; // skip non-video units
+                if (unit?.type !== 'lecture') { nonLectureUnits++; continue; } // skip non-video units
                 totalUnits++;
-                const unitOrder = String(unitIndex + 1).padStart(2, '0');
-                const baseFileName = `${unitOrder} - ${sanitizeName(unit.title || unit.slug || 'lecture')}.mp4`;
+                const unitNo = unitIndex + 1;
+                const baseFileName = `قسمت ${unitNo} - ${sanitizeName(unit.title || unit.slug || 'lecture')}.mp4`;
                 const finalFileName = (sampleBytesToDownload && sampleBytesToDownload > 0)
                     ? baseFileName.replace(/\.mp4$/i, '.sample.mp4')
                     : baseFileName;
@@ -940,8 +1088,8 @@ async function main() {
                 const lectureUrl = buildLectureUrl(courseSlug, chapter, unit);
                 try {
                     // Fetch lecture page HTML
-                    const res = await fetchWithTimeout(lectureUrl, { headers: { ...commonHeaders(normalizedCourseUrl), accept: 'text/html' } });
-                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                    const res = await fetchWithRetry(lectureUrl, { headers: { ...commonHeaders(normalizedCourseUrl), accept: 'text/html' } });
+                    if (!res.ok) throw new Error(explainHttpFailure(res.status, 'Fetch lecture page'));
                     const html = await res.text();
                     const videoSources = extractVideoSources(html);
                     const bestSourceUrl = pickBestSource(videoSources);
@@ -950,7 +1098,7 @@ async function main() {
 
                     // Print the filename on its own line; progress bar will render on the next line
                     console.log(`📥 Downloading: ${finalFileName}`);
-                    const status = await downloadToFile(bestSourceUrl, outputFilePath, lectureUrl, 3, sampleBytesToDownload, '');
+                    const status = await downloadToFile(bestSourceUrl, outputFilePath, lectureUrl, RUNTIME_CONFIG.retryAttempts, sampleBytesToDownload, '');
                     if (status === 'exists') { console.log(paintYellow(`🟡 SKIP exists: ${finalFileName}`)); skippedCount++; }
                     else { logSuccess(`DOWNLOADED: ${finalFileName}`); downloadedCount++; }
 
@@ -972,7 +1120,7 @@ async function main() {
                                         continue;
                                     }
                                     console.log(`📝 Subtitle: ${subtitleName}`);
-                                    const sStatus = await downloadToFile(absUrl, subtitlePath, lectureUrl, 3, 0, '');
+                                    const sStatus = await downloadToFile(absUrl, subtitlePath, lectureUrl, RUNTIME_CONFIG.retryAttempts, 0, '');
                                     if (sStatus === 'exists') console.log(paintYellow(`🟡 Subtitle exists: ${subtitleName}`));
                                     else logSuccess(`SUBTITLE: ${subtitleName}`);
                                     await sleep(150);
@@ -1004,7 +1152,7 @@ async function main() {
                                         continue;
                                     }
                                     console.log(`📎 Attachment: ${finalAttachmentName}`);
-                                    const aStatus = await downloadToFile(attUrl, attachmentPath, lectureUrl, 3, 0, '');
+                                    const aStatus = await downloadToFile(attUrl, attachmentPath, lectureUrl, RUNTIME_CONFIG.retryAttempts, 0, '');
                                     if (aStatus === 'exists') console.log(paintYellow(`🟡 Attachment exists: ${finalAttachmentName}`));
                                     else logSuccess(`ATTACHMENT: ${finalAttachmentName}`);
                                     await sleep(200);
@@ -1030,6 +1178,13 @@ async function main() {
         console.log(`✅ Downloaded: ${paintGreen(String(downloadedCount))}`);
         console.log(`🟡 Skipped: ${paintYellow(String(skippedCount))}`);
         console.log(`❌ Failed: ${paintRed(String(failedCount))}`);
+        if (totalUnits === 0) {
+            if (nonLectureUnits > 0) {
+                logInfo(`No downloadable video lectures found. This course appears to contain only non-video units (e.g. assignment/quiz).`);
+            } else {
+                logInfo('No downloadable video lectures found for this course with current access/session.');
+            }
+        }
     }
 }
 

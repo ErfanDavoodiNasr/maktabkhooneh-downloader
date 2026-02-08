@@ -27,13 +27,14 @@ https://github.com/user-attachments/assets/38ecfd3e-4281-4e20-854d-18ad5dae5691
 ## 🔐 ورود (Login) و نشست چندکاربره
 دو راه اصلی:
 
-1. استفاده از ایمیل و پسورد: (ساده و پیشنهاد می‌شود)
-	 ```powershell
-	 node download.mjs "https://maktabkhooneh.org/course/<slug>/" --user you@example.com --pass "Secret123" 
+1. استفاده از ایمیل و پسورد از طریق `env` یا فایل `.env` (پیشنهادی):
+	 ```bash
+	 MK_EMAIL="you@example.com"
+	 MK_PASSWORD="Secret123"
 	 ```
 	 در اولین ورود، کوکی (csrftoken + sessionid) در فایل پیش‌فرض `session.json` ذخیره می‌شود و دفعات بعد بدون نیاز به پسورد استفاده می‌گردد (مگر این که منقضی شود یا `--force-login` بزنید).
 2. استفاده از کوکی آماده (Override):
-	 اگر نمی‌خواهید پسورد را در خط فرمان بزنید، می‌توانید کوکی را به صورت دستی (مانند قبل) ست کنید تا لاگین خودکار نادیده گرفته شود.
+	 اگر نمی‌خواهید ایمیل/پسورد را وارد کنید، می‌توانید کوکی را دستی ست کنید تا لاگین خودکار نادیده گرفته شود.
 
 ### ساختار فایل نشست
 فایل `session.json` به صورت چندکاربره است:
@@ -46,12 +47,12 @@ https://github.com/user-attachments/assets/38ecfd3e-4281-4e20-854d-18ad5dae5691
 	"lastUsed": "you@example.com"
 }
 ```
-در هر اجرا اگر `--user` مشخص کنید همان کاربر هدف قرار می‌گیرد، وگرنه آخرین کاربر استفاده شده بررسی می‌شود.
+در هر اجرا اگر `MK_EMAIL` تنظیم شده باشد همان کاربر هدف قرار می‌گیرد، وگرنه آخرین کاربر استفاده شده بررسی می‌شود.
 
 ### اجبار ورود مجدد
 اگر می‌خواهید با وجود معتبر بودن نشست، دوباره لاگین شود:
 ```powershell
-node download.mjs "https://maktabkhooneh.org/course/<slug>/" --user you@example.com --pass "Secret123" --force-login 
+node download.mjs "https://maktabkhooneh.org/course/<slug>/" --force-login
 ```
 
 ## ⚠️ تنظیم کوکی (روش دستی قدیمی که پیشنهاد نمی‌شود!)
@@ -108,14 +109,14 @@ node download.mjs --help
 node download.mjs "https://maktabkhooneh.org/course/<slug>/" 
 ```
 
-اجرای دانلود با ورود خودکار و ذخیره نشست:
-```powershell
-node download.mjs "https://maktabkhooneh.org/course/<slug>/" --user you@example.com --pass "Secret123" 
+اجرای دانلود با ورود خودکار و ذخیره نشست (از `env` یا `.env`):
+```bash
+MK_EMAIL="you@example.com" MK_PASSWORD="Secret123" node download.mjs "https://maktabkhooneh.org/course/<slug>/"
 ```
 
 اجبار ورود مجدد:
 ```powershell
-node download.mjs "https://maktabkhooneh.org/course/<slug>/" --user you@example.com --pass "Secret123" --force-login 
+node download.mjs "https://maktabkhooneh.org/course/<slug>/" --force-login
 ```
 
 نکته: آدرس صفحه دوره‌ی مورد نظر را در دستورات فوق جایگزین کنید.
@@ -131,6 +132,26 @@ node download.mjs "https://maktabkhooneh.org/course/<slug>/" --sample-bytes 6553
 ```powershell
 $env:MK_SAMPLE_BYTES = "512000" 
 node download.mjs "https://maktabkhooneh.org/course/<slug>/" 
+```
+
+## ♻️ Retry و Timeout
+به صورت پیش‌فرض، ابزار برای خطاهای موقت شبکه، timeout و خطاهای 5xx با **Exponential Backoff** دوباره تلاش می‌کند.
+
+- `retry attempts` پیش‌فرض: `4`
+- `request timeout` پیش‌فرض: `30000` میلی‌ثانیه
+- `read timeout` پیش‌فرض: `120000` میلی‌ثانیه
+
+تنظیم فقط از طریق env یا `.env`:
+```bash
+MK_RETRY_ATTEMPTS=5
+MK_REQUEST_TIMEOUT_MS=45000
+MK_READ_TIMEOUT_MS=180000
+```
+
+متغیرهای لاگین:
+```bash
+MK_EMAIL=you@example.com
+MK_PASSWORD=Secret123
 ```
 
 ## 📁 ساختار خروجی
