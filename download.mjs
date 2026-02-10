@@ -127,10 +127,28 @@ function isRetriableNetworkError(err) {
 }
 
 const ACTIONABLE_URL_PLACEHOLDER = 'https://maktabkhooneh.org/course/<slug>/';
+const ACTIONABLE_SLUG_PLACEHOLDER = '<slug>';
 
 function trimUrlForHint(url) {
     const u = String(url || '').trim();
     return u || ACTIONABLE_URL_PLACEHOLDER;
+}
+
+function normalizeBaseUrl(baseUrl) {
+    const b = String(baseUrl || '').trim();
+    if (!b) return `${ORIGIN}/course/`;
+    return b.endsWith('/') ? b : `${b}/`;
+}
+
+function isLikelyFullUrl(text) {
+    return /^https?:\/\//i.test(String(text || '').trim());
+}
+
+function buildCourseUrlFromSlug(baseUrl, slug) {
+    const s = String(slug || '').trim().replace(/^\/+|\/+$/g, '');
+    if (!s) return null;
+    const b = normalizeBaseUrl(baseUrl);
+    return `${b}${encodeURIComponent(s)}/`;
 }
 
 function buildActionableError(code, why, next) {
@@ -274,11 +292,11 @@ function printUsage() {
 
     // Usage
     console.log(paintBold('Usage:'));
-    console.log(`  ${paintCyan('node download.mjs')} ${paintYellow('<course_url>')} [options]`);
+    console.log(`  ${paintCyan('node download.mjs')} ${paintYellow('[slug|course_url]')} [options]`);
 
     // Options
     console.log('\n' + paintBold('Options:'));
-    console.log(`  ${paintYellow('<course_url>')}                The maktabkhooneh course URL (e.g., https://maktabkhooneh.org/course/<slug>/)`);
+    console.log(`  ${paintYellow('[slug|course_url]')}           Course slug (preferred) or full course URL`);
     console.log(`  ${paintGreen('--sample-bytes')} ${paintYellow('N')}            Download only the first N bytes of each video`);
     console.log(`  ${paintGreen('--chapter')} ${paintYellow('SPEC')}           Select chapter(s): e.g. 2 or 1,3 or 2-4`);
     console.log(`  ${paintGreen('--lesson')} ${paintYellow('SPEC')}            Select lesson(s) inside selected chapter(s): e.g. 2 or 2-5,9`);
@@ -294,16 +312,17 @@ function printUsage() {
     console.log(`    runtime.retryAttempts        Retry attempts for transient failures`);
     console.log(`    runtime.requestTimeoutMs     Request timeout in ms`);
     console.log(`    runtime.readTimeoutMs        Read timeout in ms`);
+    console.log(`    course.baseUrl                   Base URL for slug input`);
     console.log(`    defaults.chapter / defaults.lesson / defaults.dryRun`);
 
     // Examples
     console.log('\n' + paintBold('Examples:'));
-    console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/"'));
-    console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/" --sample-bytes 65536 --verbose'));
-    console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/" --dry-run'));
-    console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/" --chapter 2 --lesson 2-5,9'));
-    console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/" --config ./config.json'));
-    console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/" --force-login'));
+    console.log('  ' + paintCyan('node download.mjs "<slug>"'));
+    console.log('  ' + paintCyan('node download.mjs "<slug>" --sample-bytes 65536 --verbose'));
+    console.log('  ' + paintCyan('node download.mjs "<slug>" --dry-run'));
+    console.log('  ' + paintCyan('node download.mjs "<slug>" --chapter 2 --lesson 2-5,9'));
+    console.log('  ' + paintCyan('node download.mjs "<slug>" --config ./config.json'));
+    console.log('  ' + paintCyan('node download.mjs "<slug>" --force-login'));
     console.log('');
 }
 
@@ -331,13 +350,14 @@ function parseNumberSpec(spec) {
 
 function parseCLI(config = {}, configPath = DEFAULT_CONFIG_FILE) {
     const args = process.argv.slice(2);
-    let inputCourseUrl = typeof config.courseUrl === 'string' ? config.courseUrl.trim() : null;
+    let inputCourseRef = null;
     let sampleBytesToDownload = parseNonNegativeInt(config.sampleBytes, DEFAULT_SAMPLE_BYTES);
     let isVerboseLoggingEnabled = !!config.verbose;
     let isDryRun = !!config.dryRun;
     let chapterSpec = config.chapter ?? null;
     let lessonSpec = config.lesson ?? null;
     let forceLogin = !!config.forceLogin;
+    let positionalCourseSet = false;
     for (let i = 0; i < args.length; i++) {
         const a = args[i];
         if (a === '--help' || a === '-h') {
@@ -368,8 +388,9 @@ function parseCLI(config = {}, configPath = DEFAULT_CONFIG_FILE) {
             isDryRun = true;
         } else if (a === '--force-login') {
             forceLogin = true;
-        } else if (!inputCourseUrl) {
-            inputCourseUrl = a;
+        } else if (!positionalCourseSet) {
+            inputCourseRef = a;
+            positionalCourseSet = true;
         }
     }
     const chapterSpecText = Array.isArray(chapterSpec) ? chapterSpec.join(',') : chapterSpec;
@@ -377,7 +398,7 @@ function parseCLI(config = {}, configPath = DEFAULT_CONFIG_FILE) {
     const selectedChapters = parseNumberSpec(chapterSpecText);
     const selectedLessons = parseNumberSpec(lessonSpecText);
     return {
-        inputCourseUrl,
+        inputCourseRef,
         sampleBytesToDownload,
         isVerboseLoggingEnabled,
         isDryRun,
@@ -1159,8 +1180,8 @@ async function main() {
     const runtimeCfg = (config.runtime && typeof config.runtime === 'object') ? config.runtime : {};
     const defaultsCfg = (config.defaults && typeof config.defaults === 'object') ? config.defaults : {};
     const authCfg = (config.auth && typeof config.auth === 'object') ? config.auth : {};
+    const courseCfg = (config.course && typeof config.course === 'object') ? config.course : {};
     const parserDefaults = {
-        courseUrl: typeof config.courseUrl === 'string' ? config.courseUrl : null,
         sampleBytes: runtimeCfg.sampleBytes ?? defaultsCfg.sampleBytes ?? 0,
         verbose: defaultsCfg.verbose ?? false,
         dryRun: defaultsCfg.dryRun ?? false,
@@ -1169,7 +1190,7 @@ async function main() {
         forceLogin: defaultsCfg.forceLogin ?? false
     };
     const {
-        inputCourseUrl, sampleBytesToDownload, isVerboseLoggingEnabled, isDryRun, forceLogin, selectedChapters, selectedLessons
+        inputCourseRef, sampleBytesToDownload, isVerboseLoggingEnabled, isDryRun, forceLogin, selectedChapters, selectedLessons
     } = parseCLI(parserDefaults, configPath);
     LOGIN_EMAIL = String(authCfg.email || '').trim();
     LOGIN_PASSWORD = String(authCfg.password || '').trim();
@@ -1188,14 +1209,30 @@ async function main() {
     const userEmail = LOGIN_EMAIL || null;
     const userPassword = LOGIN_PASSWORD || null;
     const { verbose } = createVerboseLogger(isVerboseLoggingEnabled);
-    if (!inputCourseUrl) { printUsage(); process.exit(1); }
+    if (!inputCourseRef) { printUsage(); process.exit(1); }
+    const baseUrl = normalizeBaseUrl(courseCfg.baseUrl || `${ORIGIN}/course/`);
+    const resolvedCourseUrl = isLikelyFullUrl(inputCourseRef)
+        ? String(inputCourseRef).trim()
+        : buildCourseUrlFromSlug(baseUrl, inputCourseRef);
+    if (!resolvedCourseUrl) {
+        logError(buildActionableError(
+            'COURSE_INPUT',
+            'Course slug/url is missing.',
+            [
+                `Pass slug in CLI: node download.mjs "${ACTIONABLE_SLUG_PLACEHOLDER}"`,
+                `Or pass full URL: node download.mjs "${ACTIONABLE_URL_PLACEHOLDER}"`
+            ]
+        ));
+        process.exit(1);
+    }
     verbose(`Config file: ${configPath}${fs.existsSync(configPath) ? '' : ' (not found, using defaults)'}`);
+    verbose(`Resolved course URL: ${resolvedCourseUrl}`);
     verbose(`Runtime config => retries=${RUNTIME_CONFIG.retryAttempts}, request-timeout=${RUNTIME_CONFIG.requestTimeoutMs}ms, read-timeout=${RUNTIME_CONFIG.readTimeoutMs}ms`);
     // Attempt to load / create / verify session (may already return core)
-    const prep = await prepareSession({ userEmail, userPassword, verbose, courseUrl: inputCourseUrl, forceLogin, config, configPath });
+    const prep = await prepareSession({ userEmail, userPassword, verbose, courseUrl: resolvedCourseUrl, forceLogin, config, configPath });
     ensureCookiePresent();
 
-    const normalizedCourseUrl = ensureTrailingSlash(inputCourseUrl.trim());
+    const normalizedCourseUrl = ensureTrailingSlash(resolvedCourseUrl.trim());
     const courseSlug = extractCourseSlug(normalizedCourseUrl);
     // Build a cleaner course folder name: remove trailing mk id and replace dashes with spaces.
     const courseDisplayName = normalizeCourseFolderNameFromSlug(courseSlug);

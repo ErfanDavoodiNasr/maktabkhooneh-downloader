@@ -1,5 +1,7 @@
 {
-  "courseUrl": "https://maktabkhooneh.org/course/<slug>/",
+  "course": {
+    "baseUrl": "https://maktabkhooneh.org/course/"
+  },
   "auth": {
     "email": "",
     "password": "",
