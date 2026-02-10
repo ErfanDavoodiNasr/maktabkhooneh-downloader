@@ -98,20 +98,66 @@ function isRetriableNetworkError(err) {
     return ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE', 'ENOTFOUND', 'EHOSTUNREACH', 'EAI_AGAIN'].includes(c);
 }
 
+const ACTIONABLE_URL_PLACEHOLDER = 'https://maktabkhooneh.org/course/<slug>/';
+
+function trimUrlForHint(url) {
+    const u = String(url || '').trim();
+    return u || ACTIONABLE_URL_PLACEHOLDER;
+}
+
+function buildActionableError(code, why, next) {
+    const nextLines = Array.isArray(next) ? next.filter(Boolean) : [next].filter(Boolean);
+    const lines = [`[${code}] ${why}`];
+    if (nextLines.length > 0) {
+        lines.push('Next step:');
+        for (const n of nextLines) lines.push(`- ${n}`);
+    }
+    return lines.join('\n');
+}
+
 function explainHttpFailure(status, context = 'request') {
     if (status === 401) {
-        return `${context} failed with 401 Unauthorized. Login session is invalid/expired. Re-login with MK_EMAIL/MK_PASSWORD or refresh MK_COOKIE.`;
+        return buildActionableError(
+            'AUTH_401',
+            `${context} failed with 401 Unauthorized. Your session/cookie is invalid or expired.`,
+            [
+                `Re-login with: node download.mjs "${ACTIONABLE_URL_PLACEHOLDER}" --force-login`,
+                'Or set credentials: MK_EMAIL="you@example.com" MK_PASSWORD="Secret123"'
+            ]
+        );
     }
     if (status === 403) {
-        return `${context} failed with 403 Forbidden. You do not have access to this content/course, or your cookie is rejected.`;
+        return buildActionableError(
+            'ACCESS_403',
+            `${context} failed with 403 Forbidden. Your account does not have access to this course/content, or cookie was rejected.`,
+            [
+                'Make sure you are logged in with the account that purchased the course.',
+                `Retry after re-login: node download.mjs "${ACTIONABLE_URL_PLACEHOLDER}" --force-login`
+            ]
+        );
     }
     if (status === 429) {
-        return `${context} failed with 429 Too Many Requests. Reduce request rate and retry later.`;
+        return buildActionableError(
+            'RATE_LIMIT_429',
+            `${context} failed with 429 Too Many Requests.`,
+            [
+                'Wait a few minutes and retry.',
+                'Optionally reduce pressure by selecting smaller scope: --chapter 1 --lesson 1-3'
+            ]
+        );
     }
     if (status >= 500) {
-        return `${context} failed with ${status}. Server-side temporary error.`;
+        return buildActionableError(
+            `SERVER_${status}`,
+            `${context} failed with ${status}. Temporary server-side issue.`,
+            'Retry the same command after a short delay.'
+        );
     }
-    return `${context} failed with HTTP ${status}.`;
+    return buildActionableError(
+        `HTTP_${status}`,
+        `${context} failed with HTTP ${status}.`,
+        'Run again with --verbose to inspect details.'
+    );
 }
 
 const RUNTIME_CONFIG = {
@@ -184,7 +230,15 @@ function buildProgressBar(ratio, width = 24) {
 
 function ensureCookiePresent() {
     if (!(ACTIVE_COOKIE && ACTIVE_COOKIE !== 'PUT_YOUR_COOKIE_HERE') && !(COOKIE && COOKIE !== 'PUT_YOUR_COOKIE_HERE')) {
-        logError('No active session. Set MK_EMAIL/MK_PASSWORD (or MK_COOKIE / MK_COOKIE_FILE).');
+        logError(buildActionableError(
+            'SESSION_MISSING',
+            'No active session/cookie found.',
+            [
+                'Set credentials: MK_EMAIL="you@example.com" MK_PASSWORD="Secret123"',
+                'Or provide cookie: MK_COOKIE or MK_COOKIE_FILE',
+                `Then run: node download.mjs "${ACTIONABLE_URL_PLACEHOLDER}"`
+            ]
+        ));
         process.exit(1);
     }
 }
@@ -311,14 +365,31 @@ function extractCourseSlug(courseUrl) {
     try {
         const parsed = new URL(courseUrl);
         if (parsed.origin !== ORIGIN) {
-            throw new Error('Unexpected origin: ' + parsed.origin);
+            throw new Error(buildActionableError(
+                'URL_ORIGIN',
+                `Unexpected origin: ${parsed.origin}. Only ${ORIGIN} is supported.`,
+                `Use a full course URL like: ${ACTIONABLE_URL_PLACEHOLDER}`
+            ));
         }
         const parts = parsed.pathname.split('/').filter(Boolean);
         const idx = parts.indexOf('course');
-        if (idx === -1 || !parts[idx + 1]) throw new Error('Cannot parse course slug');
+        if (idx === -1 || !parts[idx + 1]) {
+            throw new Error(buildActionableError(
+                'URL_FORMAT',
+                'Cannot parse course slug from URL path.',
+                `Expected format: ${ACTIONABLE_URL_PLACEHOLDER}`
+            ));
+        }
         return parts[idx + 1];
     } catch (e) {
-        throw new Error('Invalid course URL: ' + e.message);
+        if (String(e?.message || '').includes('[URL_')) {
+            throw e;
+        }
+        throw new Error(buildActionableError(
+            'URL_INVALID',
+            `Invalid course URL: ${e.message}`,
+            `Example: node download.mjs "${ACTIONABLE_URL_PLACEHOLDER}"`
+        ));
     }
 }
 
@@ -624,7 +695,13 @@ async function rawRequestWithRetry(urlStr, reqOpts = {}, verbose = () => { }) {
 }
 
 async function loginWithCredentialsInline(email, password, verbose = () => { }) {
-    if (!email || !password) throw new Error('Email & password required for login');
+    if (!email || !password) {
+        throw new Error(buildActionableError(
+            'LOGIN_INPUT',
+            'Email and password are required for login.',
+            'Set MK_EMAIL and MK_PASSWORD, then retry with --force-login.'
+        ));
+    }
     const store = new SimpleCookieStore();
     const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36';
     // Helper small debug printer (always go through verbose)
@@ -651,7 +728,16 @@ async function loginWithCredentialsInline(email, password, verbose = () => { }) 
         if (!csrf) csrf = store.get('csrftoken') || null;
         dbg('Fallback core-data for CSRF status:', r2.status);
     }
-    if (!csrf) throw new Error('Cannot obtain CSRF token');
+    if (!csrf) {
+        throw new Error(buildActionableError(
+            'LOGIN_CSRF',
+            'Cannot obtain CSRF token from server.',
+            [
+                'Your session/cookie may be stale or blocked.',
+                `Retry: node download.mjs "${ACTIONABLE_URL_PLACEHOLDER}" --force-login --verbose`
+            ]
+        ));
+    }
     dbg('CSRF token:', csrf.slice(0, 8) + '...');
 
     const cookieHeader = () => store.headerString();
@@ -689,15 +775,27 @@ async function loginWithCredentialsInline(email, password, verbose = () => { }) 
     let jCheck = null; try { jCheck = JSON.parse(r.body); } catch { }
     if (!jCheck) {
         dbg('check-active-user raw body:', r.body.slice(0, 300));
-        throw new Error('check-active-user invalid JSON status=' + r.status);
+        throw new Error(buildActionableError(
+            'LOGIN_CHECK_JSON',
+            `check-active-user returned invalid JSON (HTTP ${r.status}).`,
+            'Retry with --verbose. If it persists, retry later.'
+        ));
     }
     dbg('check-active-user response:', jCheck.status, jCheck.message);
     if (jCheck.status !== 'success') {
         // Provide clearer error details
-        throw new Error('check-active-user failed status=' + jCheck.status + ' message=' + jCheck.message);
+        throw new Error(buildActionableError(
+            'LOGIN_CHECK_FAILED',
+            `check-active-user failed (status=${jCheck.status}, message=${jCheck.message}).`,
+            'Verify MK_EMAIL is correct, then retry with --force-login.'
+        ));
     }
     if (jCheck.message !== 'get-pass') {
-        throw new Error('Unsupported flow (expected get-pass, got ' + jCheck.message + ')');
+        throw new Error(buildActionableError(
+            'LOGIN_FLOW',
+            `Unsupported login flow (expected get-pass, got ${jCheck.message}).`,
+            'Run with --verbose and update script if site login flow changed.'
+        ));
     }
     dbg('check-active-user OK');
 
@@ -724,16 +822,32 @@ async function loginWithCredentialsInline(email, password, verbose = () => { }) 
     let jLogin = null; try { jLogin = JSON.parse(r.body); } catch { }
     if (!jLogin) {
         dbg('login-authentication raw body:', r.body.slice(0, 300));
-        throw new Error('login-authentication invalid JSON status=' + r.status);
+        throw new Error(buildActionableError(
+            'LOGIN_AUTH_JSON',
+            `login-authentication returned invalid JSON (HTTP ${r.status}).`,
+            'Retry with --verbose. If it persists, try again later.'
+        ));
     }
     dbg('login-authentication response:', jLogin.status, jLogin.message);
-    if (jLogin.status !== 'success') throw new Error('login-authentication failed message=' + jLogin.message);
+    if (jLogin.status !== 'success') {
+        throw new Error(buildActionableError(
+            'LOGIN_AUTH_FAILED',
+            `login-authentication failed (message=${jLogin.message}).`,
+            'Check MK_EMAIL/MK_PASSWORD and retry with --force-login.'
+        ));
+    }
     dbg('login-authentication OK');
 
     // Compose final cookie header (only what we need for reuse)
     const sessionid = store.get('sessionid');
     const csrftoken = store.get('csrftoken') || csrf;
-    if (!sessionid) throw new Error('Session cookie missing after login');
+    if (!sessionid) {
+        throw new Error(buildActionableError(
+            'LOGIN_COOKIE',
+            'Session cookie (sessionid) is missing after login.',
+            'Retry with --verbose. Server response/cookies may have changed.'
+        ));
+    }
     ACTIVE_COOKIE = `csrftoken=${csrftoken}; sessionid=${sessionid}`;
     dbg('ACTIVE_COOKIE prepared');
     return true;
@@ -821,7 +935,14 @@ async function prepareSession({ userEmail, userPassword, sessionFile, verbose, c
 
     // 4. If we reach here, maybe we still have ACTIVE_COOKIE but verification failed or no cookie
     if (!ACTIVE_COOKIE) {
-        logWarn('No usable session found. Set MK_EMAIL and MK_PASSWORD to create one.');
+        logWarn(buildActionableError(
+            'SESSION_INVALID',
+            'No usable session found or stored session is expired.',
+            [
+                'Set MK_EMAIL and MK_PASSWORD in env/.env',
+                `Then run: node download.mjs "${trimUrlForHint(courseUrl)}" --force-login`
+            ]
+        ));
     }
     return { core: null, source: 'none' };
 }
@@ -1073,12 +1194,29 @@ async function main() {
         try {
             coreData = await fetchCoreData(normalizedCourseUrl);
         } catch (e) {
-            logError('Failed to verify authentication:', e.message);
+            logError(buildActionableError(
+                'AUTH_VERIFY',
+                `Failed to verify authentication. ${e.message}`,
+                [
+                    `Retry login: node download.mjs "${trimUrlForHint(normalizedCourseUrl)}" --force-login`,
+                    'Or set MK_EMAIL/MK_PASSWORD if missing.'
+                ]
+            ));
             process.exit(1);
         }
     }
     const ok = printProfileSummary(coreData);
-    if (!ok) { logError('Not logged in. Session invalid. Set MK_EMAIL/MK_PASSWORD or provide a valid cookie.'); process.exit(1); }
+    if (!ok) {
+        logError(buildActionableError(
+            'AUTH_REQUIRED',
+            'Not logged in. Session is invalid/expired.',
+            [
+                `Run: node download.mjs "${trimUrlForHint(normalizedCourseUrl)}" --force-login`,
+                'Or set MK_EMAIL/MK_PASSWORD (or a valid MK_COOKIE).'
+            ]
+        ));
+        process.exit(1);
+    }
 
     console.log(`📚 Course slug: ${paintBold(decodeURIComponent(courseSlug))}`);
     console.log(`📁 Output folder: ${paintCyan(outputRootFolder)}`);
@@ -1096,7 +1234,18 @@ async function main() {
     verbose(paintCyan('Fetching chapters...'));
     const chaptersData = await fetchChapters(courseSlug, normalizedCourseUrl);
     const chapters = Array.isArray(chaptersData?.chapters) ? chaptersData.chapters : [];
-    if (chapters.length === 0) { logError('No chapters found. Make sure the URL and cookie are correct.'); process.exit(2); }
+    if (chapters.length === 0) {
+        logError(buildActionableError(
+            'CHAPTERS_EMPTY',
+            'No chapters returned for this course URL.',
+            [
+                'Check that the URL is a valid course page.',
+                'Ensure this account has access to the course.',
+                `Retry: node download.mjs "${trimUrlForHint(normalizedCourseUrl)}" --force-login`
+            ]
+        ));
+        process.exit(2);
+    }
 
     // Iterate chapters and units
     let totalUnits = 0, downloadedCount = 0, skippedCount = 0, failedCount = 0, nonLectureUnits = 0;
@@ -1237,10 +1386,17 @@ async function main() {
 
 main().catch(err => {
     if (/Invalid (range|number token|number)/.test(String(err?.message || ''))) {
-        logError(`Invalid --chapter/--lesson format: ${err.message}`);
-        logInfo('Examples: --chapter 2  |  --chapter 1,3  |  --chapter 2-4  |  --lesson 2-5,9');
+        logError(buildActionableError(
+            'FILTER_FORMAT',
+            `Invalid --chapter/--lesson format: ${err.message}`,
+            'Examples: --chapter 2 | --chapter 1,3 | --chapter 2-4 | --lesson 2-5,9'
+        ));
         process.exit(2);
     }
-    logError('Fatal:', err);
+    logError(buildActionableError(
+        'FATAL',
+        String(err?.message || err),
+        'Retry with --verbose to see more details.'
+    ));
     process.exit(1);
 });
