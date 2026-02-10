@@ -262,6 +262,7 @@ function printUsage() {
     console.log(`  ${paintGreen('--sample-bytes')} ${paintYellow('N')}            Download only the first N bytes of each video (also via env MK_SAMPLE_BYTES)`);
     console.log(`  ${paintGreen('--chapter')} ${paintYellow('SPEC')}           Select chapter(s): e.g. 2 or 1,3 or 2-4`);
     console.log(`  ${paintGreen('--lesson')} ${paintYellow('SPEC')}            Select lesson(s) inside selected chapter(s): e.g. 2 or 2-5,9`);
+    console.log(`  ${paintGreen('--dry-run')}                   Preview files and estimated sizes without downloading`);
     console.log(`  ${paintGreen('--session-file')} ${paintYellow('<FILE>')}       Session store path (default: session.json, multi-user)`);
     console.log(`  ${paintGreen('--force-login')}               Force fresh login even if stored session is valid`);
     console.log(`  ${paintGreen('--verbose')} | ${paintGreen('-v')}              Verbose debug / HTTP flow info`);
@@ -278,6 +279,7 @@ function printUsage() {
     console.log('\n' + paintBold('Examples:'));
     console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/"'));
     console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/" --sample-bytes 65536 --verbose'));
+    console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/" --dry-run'));
     console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/" --chapter 2 --lesson 2-5,9'));
     console.log('  ' + paintCyan('MK_EMAIL="you@example.com" MK_PASSWORD="Secret123" node download.mjs "https://maktabkhooneh.org/course/<slug>/"'));
     console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/" --force-login'));
@@ -311,6 +313,7 @@ function parseCLI() {
     let inputCourseUrl = null;
     let sampleBytesToDownload = DEFAULT_SAMPLE_BYTES;
     let isVerboseLoggingEnabled = false;
+    let isDryRun = false;
     let chapterSpec = null;
     let lessonSpec = null;
     let sessionFile = 'session.json';
@@ -340,6 +343,8 @@ function parseCLI() {
             lessonSpec = a.split('=')[1];
         } else if (a === '--verbose' || a === '-v') {
             isVerboseLoggingEnabled = true;
+        } else if (a === '--dry-run') {
+            isDryRun = true;
         } else if (a === '--force-login') {
             forceLogin = true;
         } else if (!inputCourseUrl) {
@@ -352,7 +357,7 @@ function parseCLI() {
     const selectedChapters = parseNumberSpec(chapterSpec);
     const selectedLessons = parseNumberSpec(lessonSpec);
     return {
-        inputCourseUrl, sampleBytesToDownload, isVerboseLoggingEnabled, sessionFile, forceLogin, selectedChapters, selectedLessons
+        inputCourseUrl, sampleBytesToDownload, isVerboseLoggingEnabled, isDryRun, sessionFile, forceLogin, selectedChapters, selectedLessons
     };
 }
 
@@ -1167,9 +1172,13 @@ async function downloadToFile(url, filePath, referer, maxRetries = RUNTIME_CONFI
     }
 }
 
+function toAbsoluteUrl(url, base = ORIGIN) {
+    try { return new URL(url, base).toString(); } catch { return url; }
+}
+
 async function main() {
     const {
-        inputCourseUrl, sampleBytesToDownload, isVerboseLoggingEnabled, sessionFile, forceLogin, selectedChapters, selectedLessons
+        inputCourseUrl, sampleBytesToDownload, isVerboseLoggingEnabled, isDryRun, sessionFile, forceLogin, selectedChapters, selectedLessons
     } = parseCLI();
     const userEmail = LOGIN_EMAIL || null;
     const userPassword = LOGIN_PASSWORD || null;
@@ -1185,8 +1194,10 @@ async function main() {
     // Build a cleaner course folder name: remove trailing mk id and replace dashes with spaces.
     const courseDisplayName = normalizeCourseFolderNameFromSlug(courseSlug);
     const outputRootFolder = path.resolve(process.cwd(), 'download', courseDisplayName);
-    // Ensure base output folder exists
-    try { await fs.promises.mkdir(outputRootFolder, { recursive: true }); } catch { }
+    // Ensure base output folder exists only for real downloads
+    if (!isDryRun) {
+        try { await fs.promises.mkdir(outputRootFolder, { recursive: true }); } catch { }
+    }
 
     // Verify auth profile (reuse from prepareSession if available)
     let coreData = prep.core;
@@ -1229,6 +1240,9 @@ async function main() {
     if (selectedLessons) {
         console.log(`🧭 Lesson filter: ${paintCyan(Array.from(selectedLessons).sort((a, b) => a - b).join(', '))}`);
     }
+    if (isDryRun) {
+        console.log(`🧪 Mode: ${paintYellow('DRY RUN')} (no files will be downloaded)`);
+    }
 
     // Fetch chapters
     verbose(paintCyan('Fetching chapters...'));
@@ -1245,6 +1259,130 @@ async function main() {
             ]
         ));
         process.exit(2);
+    }
+
+    if (isDryRun) {
+        let totalLectures = 0;
+        let totalLocked = 0;
+        let totalUnknownSize = 0;
+        let totalSubtitleCount = 0;
+        let totalAttachmentCount = 0;
+        let totalKnownBytes = 0;
+        console.log('—'.repeat(40));
+        console.log(paintBold('Dry-run preview (estimated sizes):'));
+        console.log(`📁 Planned output root: ${paintCyan(outputRootFolder)}`);
+        for (let chapterIndex = 0; chapterIndex < chapters.length; chapterIndex++) {
+            const chapter = chapters[chapterIndex];
+            const chapterNo = chapterIndex + 1;
+            if (selectedChapters && !selectedChapters.has(chapterNo)) continue;
+            const chapterFolder = path.join(outputRootFolder, `فصل ${chapterNo} - ${sanitizeName(chapter.title || chapter.slug || 'chapter')}`);
+            const units = Array.isArray(chapter.unit_set) ? chapter.unit_set : [];
+            let chapterLectureNo = 0;
+            let chapterKnownBytes = 0;
+            let chapterUnknownSize = 0;
+            let chapterLocked = 0;
+            let chapterSelected = 0;
+            let chapterSubtitleCount = 0;
+            let chapterAttachmentCount = 0;
+            console.log(`\n📖 Chapter ${chapterNo}: ${paintBold(chapter.title || chapter.slug)}`);
+            console.log(`📂 Output: ${paintCyan(chapterFolder)}`);
+            for (let unitIndex = 0; unitIndex < units.length; unitIndex++) {
+                const unit = units[unitIndex];
+                if (!unit?.status || unit?.type !== 'lecture') continue;
+                chapterLectureNo++;
+                if (selectedLessons && !selectedLessons.has(chapterLectureNo)) continue;
+                chapterSelected++;
+                totalLectures++;
+                const unitNo = chapterLectureNo;
+                const baseFileName = `قسمت ${unitNo} - ${sanitizeName(unit.title || unit.slug || 'lecture')}.mp4`;
+                const finalFileName = (sampleBytesToDownload && sampleBytesToDownload > 0)
+                    ? baseFileName.replace(/\.mp4$/i, '.sample.mp4')
+                    : baseFileName;
+                if (unit.locked) {
+                    chapterLocked++;
+                    totalLocked++;
+                    console.log(`  🔒 ${finalFileName}  | locked / no access`);
+                    continue;
+                }
+                const lectureUrl = buildLectureUrl(courseSlug, chapter, unit);
+                try {
+                    const res = await fetchWithRetry(lectureUrl, { headers: { ...commonHeaders(normalizedCourseUrl), accept: 'text/html' } });
+                    if (!res.ok) throw new Error(explainHttpFailure(res.status, 'Fetch lecture page'));
+                    const html = await res.text();
+                    const videoSources = extractVideoSources(html);
+                    const bestSourceUrl = pickBestSource(videoSources);
+                    if (!bestSourceUrl) {
+                        console.log(`  ⚠️ ${finalFileName}  | no video source found`);
+                        chapterUnknownSize++;
+                        totalUnknownSize++;
+                        continue;
+                    }
+                    const videoInfo = await getRemoteSizeAndRanges(bestSourceUrl, lectureUrl);
+                    const videoBytes = Number.isFinite(videoInfo?.size) ? videoInfo.size : null;
+                    const subtitleLinks = extractSubtitleLinks(html).map(s => toAbsoluteUrl(s, ORIGIN));
+                    const attachmentLinks = extractAttachmentLinks(html).map(a => toAbsoluteUrl(a, ORIGIN));
+                    let subtitleKnownBytes = 0;
+                    let subtitleUnknown = 0;
+                    let attachmentKnownBytes = 0;
+                    let attachmentUnknown = 0;
+                    for (const sUrl of subtitleLinks) {
+                        const info = await getRemoteSizeAndRanges(sUrl, lectureUrl);
+                        if (Number.isFinite(info?.size)) subtitleKnownBytes += info.size;
+                        else subtitleUnknown++;
+                    }
+                    for (const aUrl of attachmentLinks) {
+                        const info = await getRemoteSizeAndRanges(aUrl, lectureUrl);
+                        if (Number.isFinite(info?.size)) attachmentKnownBytes += info.size;
+                        else attachmentUnknown++;
+                    }
+                    chapterSubtitleCount += subtitleLinks.length;
+                    chapterAttachmentCount += attachmentLinks.length;
+                    totalSubtitleCount += subtitleLinks.length;
+                    totalAttachmentCount += attachmentLinks.length;
+                    const unitKnownBytes =
+                        (videoBytes || 0) +
+                        subtitleKnownBytes +
+                        attachmentKnownBytes;
+                    const unitUnknownCount =
+                        (videoBytes == null ? 1 : 0) +
+                        subtitleUnknown +
+                        attachmentUnknown;
+                    chapterKnownBytes += unitKnownBytes;
+                    totalKnownBytes += unitKnownBytes;
+                    if (unitUnknownCount > 0) {
+                        chapterUnknownSize++;
+                        totalUnknownSize++;
+                    }
+                    const unitOutPath = path.join(chapterFolder, finalFileName);
+                    const videoText = videoBytes == null ? 'unknown' : formatBytes(videoBytes);
+                    const subtitleText = subtitleLinks.length === 0
+                        ? 'none'
+                        : `${subtitleLinks.length} file(s), ${formatBytes(subtitleKnownBytes)}${subtitleUnknown ? ` + ${subtitleUnknown} unknown` : ''}`;
+                    const attachmentText = attachmentLinks.length === 0
+                        ? 'none'
+                        : `${attachmentLinks.length} file(s), ${formatBytes(attachmentKnownBytes)}${attachmentUnknown ? ` + ${attachmentUnknown} unknown` : ''}`;
+                    const totalText = `${formatBytes(unitKnownBytes)}${unitUnknownCount ? ` + ${unitUnknownCount} unknown` : ''}`;
+                    console.log(`  🎬 ${finalFileName}`);
+                    console.log(`     size(video): ${videoText} | subtitles: ${subtitleText} | attachments: ${attachmentText} | total: ${totalText}`);
+                    console.log(`     output: ${paintCyan(unitOutPath)}`);
+                } catch (err) {
+                    chapterUnknownSize++;
+                    totalUnknownSize++;
+                    console.log(`  ⚠️ ${finalFileName}  | size estimate failed: ${err.message}`);
+                }
+            }
+            console.log(`  ─ chapter summary: selected=${chapterSelected}, locked=${chapterLocked}, subtitles=${chapterSubtitleCount}, attachments=${chapterAttachmentCount}, estimated=${formatBytes(chapterKnownBytes)}${chapterUnknownSize ? ` + ${chapterUnknownSize} unknown item(s)` : ''}`);
+        }
+        console.log('\n' + '—'.repeat(40));
+        console.log(paintBold('Dry-run total summary:'));
+        console.log(`🎞️ Lectures selected: ${paintBold(String(totalLectures))}`);
+        console.log(`🔒 Locked lectures: ${paintYellow(String(totalLocked))}`);
+        console.log(`📝 Subtitle files: ${paintBold(String(totalSubtitleCount))}`);
+        console.log(`📎 Attachment files: ${paintBold(String(totalAttachmentCount))}`);
+        console.log(`💾 Estimated total (known sizes): ${paintGreen(formatBytes(totalKnownBytes))}`);
+        console.log(`❓ Unknown-size items: ${paintYellow(String(totalUnknownSize))}`);
+        console.log(`ℹ️ Note: This is an estimate based on server-reported sizes (HEAD/Range). Final size may differ.`);
+        return;
     }
 
     // Iterate chapters and units
