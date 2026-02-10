@@ -1228,12 +1228,12 @@ async function main() {
     verbose(`Config file: ${configPath}${fs.existsSync(configPath) ? '' : ' (not found, using defaults)'}`);
     verbose(`Resolved course URL: ${resolvedCourseUrl}`);
     verbose(`Runtime config => retries=${RUNTIME_CONFIG.retryAttempts}, request-timeout=${RUNTIME_CONFIG.requestTimeoutMs}ms, read-timeout=${RUNTIME_CONFIG.readTimeoutMs}ms`);
-    // Attempt to load / create / verify session (may already return core)
-    const prep = await prepareSession({ userEmail, userPassword, verbose, courseUrl: resolvedCourseUrl, forceLogin, config, configPath });
-    ensureCookiePresent();
-
     const normalizedCourseUrl = ensureTrailingSlash(resolvedCourseUrl.trim());
     const courseSlug = extractCourseSlug(normalizedCourseUrl);
+    // Attempt to load / create / verify session (may already return core)
+    const prep = await prepareSession({ userEmail, userPassword, verbose, courseUrl: normalizedCourseUrl, forceLogin, config, configPath });
+    ensureCookiePresent();
+
     // Build a cleaner course folder name: remove trailing mk id and replace dashes with spaces.
     const courseDisplayName = normalizeCourseFolderNameFromSlug(courseSlug);
     const outputRootFolder = path.resolve(process.cwd(), 'download', courseDisplayName);
@@ -1574,9 +1574,14 @@ main().catch(err => {
         ));
         process.exit(2);
     }
+    const rawMsg = String(err?.message || err || '');
+    if (/^\[[A-Z0-9_]+\]/.test(rawMsg) && rawMsg.includes('Next step:')) {
+        logError(rawMsg);
+        process.exit(1);
+    }
     logError(buildActionableError(
         'FATAL',
-        String(err?.message || err),
+        rawMsg,
         'Retry with --verbose to see more details.'
     ));
     process.exit(1);
