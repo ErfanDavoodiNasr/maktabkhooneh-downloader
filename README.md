@@ -3,6 +3,17 @@
 
 فقط محتوایی را دانلود کنید که طبق قوانین به آن دسترسی دارید.
 
+## نصب سریع
+### macOS / Linux
+```bash
+curl -fsSL https://raw.githubusercontent.com/ErfanDavoodiNasr/maktabkhooneh-downloader/master/install.sh | bash
+```
+
+### Windows PowerShell
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/ErfanDavoodiNasr/maktabkhooneh-downloader/master/install.ps1 | iex"
+```
+
 ## شروع سریع
 1. فایل `config.json` را باز کنید و مقدارهای `auth.email` و `auth.password` را وارد کنید.
 2. برای دیدن پیش‌نمایش محتوا و حجم تقریبی:
@@ -13,6 +24,12 @@ node download.mjs /python --dry-run
 ```bash
 node download.mjs /python
 ```
+
+این نصب سریع:
+- نسخه مناسب Node.js را بررسی/نصب می‌کنند (در صورت امکان خودکار)
+- `config.json` را می‌سازند (اگر وجود نداشته باشد)
+- ایمیل و پسورد را تعاملی می‌پرسند (اختیاری)
+- دستورات بعدی اجرا را نمایش می‌دهند
 
 ## پیش‌نیازها
 - Node.js نسخه 18 یا بالاتر
