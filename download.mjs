@@ -46,30 +46,10 @@ const logSuccess = (...a) => console.log('✅', ...a);
 const logWarn = (...a) => console.warn('⚠️', ...a);
 const logError = (...a) => console.error('❌', ...a);
 
-function loadDotEnvFile(filePath = path.resolve(process.cwd(), '.env')) {
-    try {
-        if (!fs.existsSync(filePath)) return;
-        const text = fs.readFileSync(filePath, 'utf8');
-        for (const line of text.split(/\r?\n/)) {
-            const t = line.trim();
-            if (!t || t.startsWith('#')) continue;
-            const eq = t.indexOf('=');
-            if (eq <= 0) continue;
-            const key = t.slice(0, eq).trim();
-            let val = t.slice(eq + 1).trim();
-            if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
-                val = val.slice(1, -1);
-            }
-            if (key && process.env[key] == null) process.env[key] = val;
-        }
-    } catch { }
-}
-
-loadDotEnvFile();
-
 // ===============
 // Configuration
 // ===============
+const DEFAULT_CONFIG_FILE = 'config.json';
 const DEFAULT_RETRY_ATTEMPTS = 4;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_READ_TIMEOUT_MS = 120_000;
@@ -77,6 +57,54 @@ const DEFAULT_READ_TIMEOUT_MS = 120_000;
 function parsePositiveInt(value, fallback) {
     const n = Number.parseInt(String(value ?? ''), 10);
     return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function parseNonNegativeInt(value, fallback) {
+    const n = Number.parseInt(String(value ?? ''), 10);
+    return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+function discoverConfigPath(args) {
+    for (let i = 0; i < args.length; i++) {
+        const a = args[i];
+        if (a === '--config') {
+            const v = args[i + 1];
+            return v ? v : DEFAULT_CONFIG_FILE;
+        }
+        if (a.startsWith('--config=')) {
+            return a.slice('--config='.length);
+        }
+    }
+    return DEFAULT_CONFIG_FILE;
+}
+
+function loadConfigFile(filePath) {
+    const resolved = path.resolve(process.cwd(), filePath || DEFAULT_CONFIG_FILE);
+    if (!fs.existsSync(resolved)) return { config: {}, configPath: resolved, exists: false };
+    try {
+        const txt = fs.readFileSync(resolved, 'utf8');
+        const cfg = JSON.parse(txt);
+        if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) {
+            throw new Error('config root must be a JSON object');
+        }
+        return { config: cfg, configPath: resolved, exists: true };
+    } catch (e) {
+        throw new Error(buildActionableError(
+            'CONFIG_PARSE',
+            `Cannot parse config file: ${resolved}. ${e.message}`,
+            'Fix JSON syntax, or pass another path with --config <file>.'
+        ));
+    }
+}
+
+async function saveConfigFile(configPath, config) {
+    try {
+        await fs.promises.writeFile(configPath, JSON.stringify(config, null, 2), 'utf8');
+        return true;
+    } catch (e) {
+        logWarn(`Could not persist config file (${configPath}): ${e.message}`);
+        return false;
+    }
 }
 
 function toBackoffMs(attempt) {
@@ -122,7 +150,7 @@ function explainHttpFailure(status, context = 'request') {
             `${context} failed with 401 Unauthorized. Your session/cookie is invalid or expired.`,
             [
                 `Re-login with: node download.mjs "${ACTIONABLE_URL_PLACEHOLDER}" --force-login`,
-                'Or set credentials: MK_EMAIL="you@example.com" MK_PASSWORD="Secret123"'
+                'Or set auth.email/auth.password in config.json'
             ]
         );
     }
@@ -160,22 +188,14 @@ function explainHttpFailure(status, context = 'request') {
     );
 }
 
-const RUNTIME_CONFIG = {
-    retryAttempts: parsePositiveInt(process.env.MK_RETRY_ATTEMPTS, DEFAULT_RETRY_ATTEMPTS),
-    requestTimeoutMs: parsePositiveInt(process.env.MK_REQUEST_TIMEOUT_MS ?? process.env.MK_REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT_MS),
-    readTimeoutMs: parsePositiveInt(process.env.MK_READ_TIMEOUT_MS ?? process.env.MK_READ_TIMEOUT, DEFAULT_READ_TIMEOUT_MS)
+let RUNTIME_CONFIG = {
+    retryAttempts: DEFAULT_RETRY_ATTEMPTS,
+    requestTimeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
+    readTimeoutMs: DEFAULT_READ_TIMEOUT_MS
 };
-const LOGIN_EMAIL = (process.env.MK_EMAIL || '').trim();
-const LOGIN_PASSWORD = (process.env.MK_PASSWORD || '').trim();
-
-// Cookie: read from env MK_COOKIE or file path in MK_COOKIE_FILE; fallback to placeholder.
-const COOKIE = (() => {
-    if (process.env.MK_COOKIE && process.env.MK_COOKIE.trim()) return process.env.MK_COOKIE.trim();
-    if (process.env.MK_COOKIE_FILE) {
-        try { return fs.readFileSync(process.env.MK_COOKIE_FILE, 'utf8').trim(); } catch { }
-    }
-    return 'PUT_YOUR_COOKIE_HERE';
-})();
+let LOGIN_EMAIL = '';
+let LOGIN_PASSWORD = '';
+let COOKIE = 'PUT_YOUR_COOKIE_HERE';
 // ACTIVE_COOKIE will be dynamically set after login/session load (fallback to COOKIE)
 let ACTIVE_COOKIE = null;
 // Sample mode default (0 means full download)
@@ -232,10 +252,10 @@ function ensureCookiePresent() {
     if (!(ACTIVE_COOKIE && ACTIVE_COOKIE !== 'PUT_YOUR_COOKIE_HERE') && !(COOKIE && COOKIE !== 'PUT_YOUR_COOKIE_HERE')) {
         logError(buildActionableError(
             'SESSION_MISSING',
-            'No active session/cookie found.',
-            [
-                'Set credentials: MK_EMAIL="you@example.com" MK_PASSWORD="Secret123"',
-                'Or provide cookie: MK_COOKIE or MK_COOKIE_FILE',
+                'No active session/cookie found.',
+                [
+                'Set credentials in config.json: auth.email and auth.password',
+                'Or provide cookie in config.json: auth.cookie or auth.cookieFile',
                 `Then run: node download.mjs "${ACTIONABLE_URL_PLACEHOLDER}"`
             ]
         ));
@@ -259,21 +279,22 @@ function printUsage() {
     // Options
     console.log('\n' + paintBold('Options:'));
     console.log(`  ${paintYellow('<course_url>')}                The maktabkhooneh course URL (e.g., https://maktabkhooneh.org/course/<slug>/)`);
-    console.log(`  ${paintGreen('--sample-bytes')} ${paintYellow('N')}            Download only the first N bytes of each video (also via env MK_SAMPLE_BYTES)`);
+    console.log(`  ${paintGreen('--sample-bytes')} ${paintYellow('N')}            Download only the first N bytes of each video`);
     console.log(`  ${paintGreen('--chapter')} ${paintYellow('SPEC')}           Select chapter(s): e.g. 2 or 1,3 or 2-4`);
     console.log(`  ${paintGreen('--lesson')} ${paintYellow('SPEC')}            Select lesson(s) inside selected chapter(s): e.g. 2 or 2-5,9`);
     console.log(`  ${paintGreen('--dry-run')}                   Preview files and estimated sizes without downloading`);
-    console.log(`  ${paintGreen('--session-file')} ${paintYellow('<FILE>')}       Session store path (default: session.json, multi-user)`);
+    console.log(`  ${paintGreen('--config')} ${paintYellow('<FILE>')}           Config file path (default: config.json)`);
     console.log(`  ${paintGreen('--force-login')}               Force fresh login even if stored session is valid`);
     console.log(`  ${paintGreen('--verbose')} | ${paintGreen('-v')}              Verbose debug / HTTP flow info`);
     console.log(`  ${paintGreen('--help')} | ${paintGreen('-h')}                 Show this help and exit`);
-    console.log('\n' + paintBold('Env vars:'));
-    console.log(`    MK_COOKIE / MK_COOKIE_FILE   Override cookie manually (bypass credential login)`);
-    console.log(`    MK_EMAIL / MK_PASSWORD       Login credentials (read from env or .env)`);
-    console.log(`    MK_SAMPLE_BYTES              Default sample bytes (overridden by --sample-bytes)`);
-    console.log(`    MK_RETRY_ATTEMPTS            Retry attempts for transient failures`);
-    console.log(`    MK_REQUEST_TIMEOUT_MS        Request timeout in ms (or MK_REQUEST_TIMEOUT)`);
-    console.log(`    MK_READ_TIMEOUT_MS           Read timeout in ms (or MK_READ_TIMEOUT)`);
+    console.log('\n' + paintBold('Config (config.json):'));
+    console.log(`    auth.email / auth.password   Login credentials`);
+    console.log(`    auth.cookie / auth.cookieFile Manual cookie override`);
+    console.log(`    runtime.sampleBytes          Default sample bytes`);
+    console.log(`    runtime.retryAttempts        Retry attempts for transient failures`);
+    console.log(`    runtime.requestTimeoutMs     Request timeout in ms`);
+    console.log(`    runtime.readTimeoutMs        Read timeout in ms`);
+    console.log(`    defaults.chapter / defaults.lesson / defaults.dryRun`);
 
     // Examples
     console.log('\n' + paintBold('Examples:'));
@@ -281,7 +302,7 @@ function printUsage() {
     console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/" --sample-bytes 65536 --verbose'));
     console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/" --dry-run'));
     console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/" --chapter 2 --lesson 2-5,9'));
-    console.log('  ' + paintCyan('MK_EMAIL="you@example.com" MK_PASSWORD="Secret123" node download.mjs "https://maktabkhooneh.org/course/<slug>/"'));
+    console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/" --config ./config.json'));
     console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/course/<slug>/" --force-login'));
     console.log('');
 }
@@ -308,25 +329,25 @@ function parseNumberSpec(spec) {
     return out;
 }
 
-function parseCLI() {
+function parseCLI(config = {}, configPath = DEFAULT_CONFIG_FILE) {
     const args = process.argv.slice(2);
-    let inputCourseUrl = null;
-    let sampleBytesToDownload = DEFAULT_SAMPLE_BYTES;
-    let isVerboseLoggingEnabled = false;
-    let isDryRun = false;
-    let chapterSpec = null;
-    let lessonSpec = null;
-    let sessionFile = 'session.json';
-    let forceLogin = false;
+    let inputCourseUrl = typeof config.courseUrl === 'string' ? config.courseUrl.trim() : null;
+    let sampleBytesToDownload = parseNonNegativeInt(config.sampleBytes, DEFAULT_SAMPLE_BYTES);
+    let isVerboseLoggingEnabled = !!config.verbose;
+    let isDryRun = !!config.dryRun;
+    let chapterSpec = config.chapter ?? null;
+    let lessonSpec = config.lesson ?? null;
+    let forceLogin = !!config.forceLogin;
     for (let i = 0; i < args.length; i++) {
         const a = args[i];
         if (a === '--help' || a === '-h') {
             printUsage();
             process.exit(0);
-        } else if (a === '--session-file') {
-            const v = args[i + 1]; if (v) { sessionFile = v; i++; }
-        } else if (a.startsWith('--session-file=')) {
-            sessionFile = a.split('=')[1];
+        } else if (a === '--config') {
+            if (args[i + 1]) i++;
+            continue;
+        } else if (a.startsWith('--config=')) {
+            continue;
         } else if (a.startsWith('--sample-bytes=')) {
             const v = a.split('=')[1];
             sampleBytesToDownload = parseInt(v, 10) || 0;
@@ -351,13 +372,19 @@ function parseCLI() {
             inputCourseUrl = a;
         }
     }
-    if (!sampleBytesToDownload && process.env.MK_SAMPLE_BYTES) {
-        sampleBytesToDownload = parseInt(process.env.MK_SAMPLE_BYTES, 10) || 0;
-    }
-    const selectedChapters = parseNumberSpec(chapterSpec);
-    const selectedLessons = parseNumberSpec(lessonSpec);
+    const chapterSpecText = Array.isArray(chapterSpec) ? chapterSpec.join(',') : chapterSpec;
+    const lessonSpecText = Array.isArray(lessonSpec) ? lessonSpec.join(',') : lessonSpec;
+    const selectedChapters = parseNumberSpec(chapterSpecText);
+    const selectedLessons = parseNumberSpec(lessonSpecText);
     return {
-        inputCourseUrl, sampleBytesToDownload, isVerboseLoggingEnabled, isDryRun, sessionFile, forceLogin, selectedChapters, selectedLessons
+        inputCourseUrl,
+        sampleBytesToDownload,
+        isVerboseLoggingEnabled,
+        isDryRun,
+        forceLogin,
+        selectedChapters,
+        selectedLessons,
+        configPath
     };
 }
 
@@ -571,39 +598,6 @@ function extractAttachmentLinks(html) {
 }
 
 // --- Session / Login helpers ---
-// --- Multi-user session file helpers ---
-// Structure:
-// {
-//   "users": { "email@example.com": { "cookie": "csrftoken=..; sessionid=..", "updated": "ISO" }, ... },
-//   "lastUsed": "email@example.com"
-// }
-async function readSessionFile(file) {
-    try {
-        const txt = await fs.promises.readFile(file, 'utf8');
-        const data = JSON.parse(txt);
-        if (data && data.users) {
-            // Already new format (or compatible)
-            return data;
-        }
-        // Backward compatibility: old single-cookie format { cookie: "..." }
-        if (data && typeof data.cookie === 'string') {
-            return {
-                users: { 'default': { cookie: data.cookie, updated: data.updated || new Date().toISOString() } },
-                lastUsed: 'default'
-            };
-        }
-    } catch { }
-    return null;
-}
-
-async function writeSessionFileMulti(file, email, cookie, existing) {
-    // email can be null -> store under 'default'
-    const key = (email || 'default').trim().toLowerCase();
-    let data = existing && existing.users ? existing : { users: {}, lastUsed: key };
-    data.users[key] = { cookie, updated: new Date().toISOString() };
-    data.lastUsed = key;
-    try { await fs.promises.writeFile(file, JSON.stringify(data, null, 2), 'utf8'); } catch { }
-}
 
 async function fetchJson(url, referer) {
     const res = await fetchWithRetry(url, { headers: { ...commonHeaders(referer), accept: 'application/json' } });
@@ -613,7 +607,7 @@ async function fetchJson(url, referer) {
 }
 
 function extractSetCookie(res) {
-    // Node fetch in Node 18 does not expose raw set-cookie headers directly. We rely on manual cookie env or future enhancement.
+    // Node fetch in Node 18 does not expose raw set-cookie headers directly. We rely on cookie from config or inline login.
     return null;
 }
 
@@ -704,7 +698,7 @@ async function loginWithCredentialsInline(email, password, verbose = () => { }) 
         throw new Error(buildActionableError(
             'LOGIN_INPUT',
             'Email and password are required for login.',
-            'Set MK_EMAIL and MK_PASSWORD, then retry with --force-login.'
+            'Set auth.email and auth.password in config.json, then retry with --force-login.'
         ));
     }
     const store = new SimpleCookieStore();
@@ -792,7 +786,7 @@ async function loginWithCredentialsInline(email, password, verbose = () => { }) 
         throw new Error(buildActionableError(
             'LOGIN_CHECK_FAILED',
             `check-active-user failed (status=${jCheck.status}, message=${jCheck.message}).`,
-            'Verify MK_EMAIL is correct, then retry with --force-login.'
+            'Verify auth.email in config.json, then retry with --force-login.'
         ));
     }
     if (jCheck.message !== 'get-pass') {
@@ -838,7 +832,7 @@ async function loginWithCredentialsInline(email, password, verbose = () => { }) 
         throw new Error(buildActionableError(
             'LOGIN_AUTH_FAILED',
             `login-authentication failed (message=${jLogin.message}).`,
-            'Check MK_EMAIL/MK_PASSWORD and retry with --force-login.'
+            'Check auth.email/auth.password in config.json and retry with --force-login.'
         ));
     }
     dbg('login-authentication OK');
@@ -858,7 +852,7 @@ async function loginWithCredentialsInline(email, password, verbose = () => { }) 
     return true;
 }
 
-async function prepareSession({ userEmail, userPassword, sessionFile, verbose, courseUrl, forceLogin }) {
+async function prepareSession({ userEmail, userPassword, verbose, courseUrl, forceLogin, config, configPath }) {
     // Helper to verify current ACTIVE_COOKIE by calling core-data
     const verify = async () => {
         try {
@@ -878,58 +872,40 @@ async function prepareSession({ userEmail, userPassword, sessionFile, verbose, c
         }
     };
 
-    // 1. Environment / explicit cookie overrides everything
+    const authCfg = (config.auth && typeof config.auth === 'object') ? config.auth : (config.auth = {});
+    const storedSessionCookie = String(authCfg.sessionCookie || '').trim();
+
+    // 1. Explicit cookie override from config has highest priority
     if (COOKIE && COOKIE !== 'PUT_YOUR_COOKIE_HERE') {
         ACTIVE_COOKIE = COOKIE;
-        verbose('Using cookie from env / file override');
+        verbose('Using cookie from config override');
         const core = await verify();
-        if (core) return { core, source: 'env' };
-        // If env cookie invalid and we have credentials we can attempt login below.
-    }
-
-    // 2. Load multi-user session store if exists
-    let sessionData = null;
-    if (sessionFile) {
-        sessionData = await readSessionFile(sessionFile);
-    }
-
-    const desiredUserKey = userEmail ? userEmail.trim().toLowerCase() : null;
-
-    // 2a. If user specified, try existing cookie first (even if password provided) unless forceLogin
-    if (sessionData && desiredUserKey && !forceLogin) {
-        const entry = sessionData.users[desiredUserKey];
-        if (entry && entry.cookie) {
-            ACTIVE_COOKIE = entry.cookie;
-            logStep(`Loaded stored session for user ${desiredUserKey}`);
-            const core = await verify();
-            if (core) {
-                if (userPassword) verbose('Reusing valid stored session; skipping login because --force-login not set');
-                return { core, source: 'stored-user' };
-            }
-            logWarn('Stored session invalid; will attempt fresh login if password provided.');
-            ACTIVE_COOKIE = null; // clear invalid
-        }
-    }
-    // 2b. If no user specified, try lastUsed
-    if (sessionData && !desiredUserKey) {
-        const key = sessionData.lastUsed;
-        if (key && sessionData.users[key] && sessionData.users[key].cookie) {
-            ACTIVE_COOKIE = sessionData.users[key].cookie;
-            logStep(`Loaded lastUsed session (${key})`);
-            const core = await verify();
-            if (core) return { core, source: 'stored-last' };
-            logWarn('Last used session invalid.');
+        if (core) return { core, source: 'config-cookie' };
+        if (!forceLogin) {
+            logWarn('Cookie from config.auth.cookie/cookieFile is invalid; trying stored session/login fallback.');
         }
     }
 
-    // 3. Need to login only if we have credentials AND either no session or it was invalid
-    if (desiredUserKey && userPassword && (!ACTIVE_COOKIE || forceLogin)) {
+    // 2. Reuse session persisted in config.auth.sessionCookie
+    if (storedSessionCookie && !forceLogin) {
+        ACTIVE_COOKIE = storedSessionCookie;
+        logStep('Loaded stored session from config.auth.sessionCookie');
+        const core = await verify();
+        if (core) return { core, source: 'config-session' };
+        logWarn('Stored config session is invalid; will attempt fresh login.');
+        ACTIVE_COOKIE = null;
+    }
+
+    // 3. Login with credentials and persist session back into config
+    if (userEmail && userPassword && (!ACTIVE_COOKIE || forceLogin)) {
         try {
-            logStep('Attempting login for ' + desiredUserKey);
+            logStep('Attempting login for ' + userEmail.trim().toLowerCase());
             await loginWithCredentialsInline(userEmail, userPassword, verbose);
-            if (ACTIVE_COOKIE && sessionFile) {
-                await writeSessionFileMulti(sessionFile, userEmail, ACTIVE_COOKIE, sessionData);
-                logSuccess('Login success; session stored for user ' + desiredUserKey);
+            if (ACTIVE_COOKIE) {
+                authCfg.sessionCookie = ACTIVE_COOKIE;
+                authCfg.sessionUpdated = new Date().toISOString();
+                await saveConfigFile(configPath, config);
+                logSuccess('Login success; session saved to config.auth.sessionCookie');
             }
             const core = await verify();
             if (core) return { core, source: 'fresh-login' };
@@ -942,9 +918,9 @@ async function prepareSession({ userEmail, userPassword, sessionFile, verbose, c
     if (!ACTIVE_COOKIE) {
         logWarn(buildActionableError(
             'SESSION_INVALID',
-            'No usable session found or stored session is expired.',
+            'No usable session found in config, or stored session is expired.',
             [
-                'Set MK_EMAIL and MK_PASSWORD in env/.env',
+                'Set auth.email and auth.password in config.json',
                 `Then run: node download.mjs "${trimUrlForHint(courseUrl)}" --force-login`
             ]
         ));
@@ -1177,16 +1153,46 @@ function toAbsoluteUrl(url, base = ORIGIN) {
 }
 
 async function main() {
+    const argv = process.argv.slice(2);
+    const configArgPath = discoverConfigPath(argv);
+    const { config, configPath } = loadConfigFile(configArgPath);
+    const runtimeCfg = (config.runtime && typeof config.runtime === 'object') ? config.runtime : {};
+    const defaultsCfg = (config.defaults && typeof config.defaults === 'object') ? config.defaults : {};
+    const authCfg = (config.auth && typeof config.auth === 'object') ? config.auth : {};
+    const parserDefaults = {
+        courseUrl: typeof config.courseUrl === 'string' ? config.courseUrl : null,
+        sampleBytes: runtimeCfg.sampleBytes ?? defaultsCfg.sampleBytes ?? 0,
+        verbose: defaultsCfg.verbose ?? false,
+        dryRun: defaultsCfg.dryRun ?? false,
+        chapter: defaultsCfg.chapter ?? null,
+        lesson: defaultsCfg.lesson ?? null,
+        forceLogin: defaultsCfg.forceLogin ?? false
+    };
     const {
-        inputCourseUrl, sampleBytesToDownload, isVerboseLoggingEnabled, isDryRun, sessionFile, forceLogin, selectedChapters, selectedLessons
-    } = parseCLI();
+        inputCourseUrl, sampleBytesToDownload, isVerboseLoggingEnabled, isDryRun, forceLogin, selectedChapters, selectedLessons
+    } = parseCLI(parserDefaults, configPath);
+    LOGIN_EMAIL = String(authCfg.email || '').trim();
+    LOGIN_PASSWORD = String(authCfg.password || '').trim();
+    if (authCfg.cookie && String(authCfg.cookie).trim()) {
+        COOKIE = String(authCfg.cookie).trim();
+    } else if (authCfg.cookieFile) {
+        try { COOKIE = fs.readFileSync(String(authCfg.cookieFile), 'utf8').trim() || 'PUT_YOUR_COOKIE_HERE'; } catch { COOKIE = 'PUT_YOUR_COOKIE_HERE'; }
+    } else {
+        COOKIE = 'PUT_YOUR_COOKIE_HERE';
+    }
+    RUNTIME_CONFIG = {
+        retryAttempts: parsePositiveInt(runtimeCfg.retryAttempts, DEFAULT_RETRY_ATTEMPTS),
+        requestTimeoutMs: parsePositiveInt(runtimeCfg.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS),
+        readTimeoutMs: parsePositiveInt(runtimeCfg.readTimeoutMs, DEFAULT_READ_TIMEOUT_MS)
+    };
     const userEmail = LOGIN_EMAIL || null;
     const userPassword = LOGIN_PASSWORD || null;
     const { verbose } = createVerboseLogger(isVerboseLoggingEnabled);
     if (!inputCourseUrl) { printUsage(); process.exit(1); }
+    verbose(`Config file: ${configPath}${fs.existsSync(configPath) ? '' : ' (not found, using defaults)'}`);
     verbose(`Runtime config => retries=${RUNTIME_CONFIG.retryAttempts}, request-timeout=${RUNTIME_CONFIG.requestTimeoutMs}ms, read-timeout=${RUNTIME_CONFIG.readTimeoutMs}ms`);
     // Attempt to load / create / verify session (may already return core)
-    const prep = await prepareSession({ userEmail, userPassword, sessionFile, verbose, courseUrl: inputCourseUrl, forceLogin });
+    const prep = await prepareSession({ userEmail, userPassword, verbose, courseUrl: inputCourseUrl, forceLogin, config, configPath });
     ensureCookiePresent();
 
     const normalizedCourseUrl = ensureTrailingSlash(inputCourseUrl.trim());
@@ -1210,7 +1216,7 @@ async function main() {
                 `Failed to verify authentication. ${e.message}`,
                 [
                     `Retry login: node download.mjs "${trimUrlForHint(normalizedCourseUrl)}" --force-login`,
-                    'Or set MK_EMAIL/MK_PASSWORD if missing.'
+                    'Or set auth.email/auth.password in config.json if missing.'
                 ]
             ));
             process.exit(1);
@@ -1223,7 +1229,7 @@ async function main() {
             'Not logged in. Session is invalid/expired.',
             [
                 `Run: node download.mjs "${trimUrlForHint(normalizedCourseUrl)}" --force-login`,
-                'Or set MK_EMAIL/MK_PASSWORD (or a valid MK_COOKIE).'
+                'Or set auth.email/auth.password (or auth.cookie) in config.json.'
             ]
         ));
         process.exit(1);

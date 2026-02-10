@@ -1,0 +1,24 @@
+{
+  "courseUrl": "https://maktabkhooneh.org/course/<slug>/",
+  "auth": {
+    "email": "",
+    "password": "",
+    "cookie": "",
+    "cookieFile": "",
+    "sessionCookie": "",
+    "sessionUpdated": ""
+  },
+  "runtime": {
+    "sampleBytes": 0,
+    "retryAttempts": 4,
+    "requestTimeoutMs": 30000,
+    "readTimeoutMs": 120000
+  },
+  "defaults": {
+    "chapter": "",
+    "lesson": "",
+    "dryRun": false,
+    "forceLogin": false,
+    "verbose": false
+  }
+}

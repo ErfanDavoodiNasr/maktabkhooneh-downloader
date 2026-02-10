@@ -9,10 +9,6 @@ package-lock.json
 yarn.lock
 pnpm-lock.yaml
 
-# Env
-.env
-.env.*.local
-
 # OS
 .DS_Store
 Thumbs.db
@@ -26,4 +22,3 @@ docs/
 backup/
 New Text Document.txt
 signup/
-session.json
