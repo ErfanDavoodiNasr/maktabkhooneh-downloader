@@ -19,10 +19,54 @@
 
 import fs from 'fs';
 import path from 'path';
-import {Readable, Transform} from 'stream';
-import {pipeline} from 'stream/promises';
 import {setTimeout as sleep} from 'timers/promises';
 import https from 'https';
+
+import {parseArgv, parseNonNegativeIntOrFallback as parseNonNegativeInt} from './lib/cli-parse.mjs';
+import {
+    assertOutputPathSafe,
+    normalizeCourseFolderNameFromSlug,
+    sanitizeContentDispositionFilename,
+    sanitizeName,
+    stripControlChars
+} from './lib/paths.mjs';
+import {
+    cookieValueFromHeader,
+    isRetriableNetworkError,
+    isRetriableStatus,
+    redactSecrets,
+    toBackoffMs,
+    TRUSTED_ORIGIN
+} from './lib/http-util.mjs';
+import {
+    DEFAULT_CONFIG_FILE,
+    DEFAULT_READ_TIMEOUT_MS,
+    DEFAULT_REQUEST_TIMEOUT_MS,
+    DEFAULT_RETRY_ATTEMPTS,
+    discoverConfigPath,
+    loadConfigFile,
+    saveConfigFile,
+    validateCourseBaseUrl,
+    validateRuntimeConfig
+} from './lib/config.mjs';
+import {
+    buildCourseUrlFromSlug,
+    detectNewUnitFormat,
+    extractCourseIdFromSlug,
+    extractCourseSlug,
+    getChapterUnits,
+    isLikelyFullUrl,
+    isUnitActive,
+    isUnitLocked,
+    isVideoLecture,
+    pickBestVideoUrl,
+    unitIdOf
+} from './lib/course-parse.mjs';
+import {
+    buildAuthAwareHeaders,
+    downloadToFile as engineDownloadToFile,
+    probeRemoteSize
+} from './lib/download-engine.mjs';
 
 // ===============
 // Console styling (ANSI colors) and emojis
@@ -50,90 +94,22 @@ const paintBoldCyan = s => `${COLOR.bold}${COLOR.cyan}${s}${COLOR.reset}`; // bo
 const paintBlue = s => paint(COLOR.blue, s);
 const paintLightBlue = s => paint(COLOR.lightBlue, s);
 
-const logInfo = (...a) => console.log('ℹ️', ...a);
-const logStep = (...a) => console.log('▶️', ...a);
-const logSuccess = (...a) => console.log('✅', ...a);
-const logWarn = (...a) => console.warn('⚠️', ...a);
-const logError = (...a) => console.error('❌', ...a);
+const secretBag = () => [LOGIN_PASSWORD, ACTIVE_COOKIE, COOKIE].filter(Boolean);
+const safeLogArgs = (args) => args.map((a) => typeof a === 'string' ? redactSecrets(stripControlChars(a), secretBag()) : a);
+const logInfo = (...a) => console.log('ℹ️', ...safeLogArgs(a));
+const logStep = (...a) => console.log('▶️', ...safeLogArgs(a));
+const logSuccess = (...a) => console.log('✅', ...safeLogArgs(a));
+const logWarn = (...a) => console.warn('⚠️', ...safeLogArgs(a));
+const logError = (...a) => console.error('❌', ...safeLogArgs(a));
 
-// ===============
-// Configuration
-// ===============
-const DEFAULT_CONFIG_FILE = 'config.json';
-const DEFAULT_RETRY_ATTEMPTS = 4;
-const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
-const DEFAULT_READ_TIMEOUT_MS = 120_000;
-
-function parsePositiveInt(value, fallback) {
-    const n = Number.parseInt(String(value ?? ''), 10);
-    return Number.isFinite(n) && n > 0 ? n : fallback;
-}
-
-function parseNonNegativeInt(value, fallback) {
-    const n = Number.parseInt(String(value ?? ''), 10);
-    return Number.isFinite(n) && n >= 0 ? n : fallback;
-}
-
-function discoverConfigPath(args) {
-    for (let i = 0; i < args.length; i++) {
-        const a = args[i];
-        if (a === '--config') {
-            const v = args[i + 1];
-            return {path: v ? v : DEFAULT_CONFIG_FILE, explicit: true};
-        }
-        if (a.startsWith('--config=')) {
-            return {path: a.slice('--config='.length), explicit: true};
-        }
-    }
-    return {path: DEFAULT_CONFIG_FILE, explicit: false};
-}
-
-function loadConfigFile(filePath) {
-    const resolved = path.resolve(process.cwd(), filePath || DEFAULT_CONFIG_FILE);
-    if (!fs.existsSync(resolved)) return {config: {}, configPath: resolved, exists: false};
+async function persistConfig(configPath, config) {
     try {
-        const txt = fs.readFileSync(resolved, 'utf8');
-        const cfg = JSON.parse(txt);
-        if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) {
-            throw new Error('config root must be a JSON object');
-        }
-        return {config: cfg, configPath: resolved, exists: true};
-    } catch (e) {
-        throw new Error(buildActionableError(
-            'CONFIG_PARSE',
-            `Cannot parse config file: ${resolved}. ${e.message}`,
-            'Fix JSON syntax, or pass another path with --config <file>.'
-        ));
-    }
-}
-
-async function saveConfigFile(configPath, config) {
-    try {
-        await fs.promises.writeFile(configPath, JSON.stringify(config, null, 2), 'utf8');
+        await saveConfigFile(configPath, config);
         return true;
     } catch (e) {
         logWarn(`Could not persist config file (${configPath}): ${e.message}`);
         return false;
     }
-}
-
-function toBackoffMs(attempt) {
-    return Math.min(30_000, 700 * (2 ** Math.max(0, attempt - 1)));
-}
-
-function isRetriableStatus(status) {
-    return status === 408 || status === 425 || status === 429 || (status >= 500 && status <= 599);
-}
-
-function isTimeoutError(err) {
-    const m = String(err?.message || '').toLowerCase();
-    return err?.name === 'AbortError' || m.includes('timeout') || m.includes('timed out');
-}
-
-function isRetriableNetworkError(err) {
-    if (isTimeoutError(err)) return true;
-    const c = String(err?.cause?.code || '').toUpperCase();
-    return ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE', 'ENOTFOUND', 'EHOSTUNREACH', 'EAI_AGAIN'].includes(c);
 }
 
 const ACTIONABLE_URL_PLACEHOLDER = 'https://maktabkhooneh.org/course/<slug>/';
@@ -142,23 +118,6 @@ const ACTIONABLE_SLUG_PLACEHOLDER = '<slug>';
 function trimUrlForHint(url) {
     const u = String(url || '').trim();
     return u || ACTIONABLE_URL_PLACEHOLDER;
-}
-
-function normalizeBaseUrl(baseUrl) {
-    const b = String(baseUrl || '').trim();
-    if (!b) return `${ORIGIN}/course/`;
-    return b.endsWith('/') ? b : `${b}/`;
-}
-
-function isLikelyFullUrl(text) {
-    return /^https?:\/\//i.test(String(text || '').trim());
-}
-
-function buildCourseUrlFromSlug(baseUrl, slug) {
-    const s = String(slug || '').trim().replace(/^\/+|\/+$/g, '');
-    if (!s) return null;
-    const b = normalizeBaseUrl(baseUrl);
-    return `${b}${encodeURIComponent(s)}/`;
 }
 
 function buildActionableError(code, why, next) {
@@ -229,13 +188,16 @@ let ACTIVE_COOKIE = null;
 // Sample mode default (0 means full download)
 const DEFAULT_SAMPLE_BYTES = 0;
 
-// Ensure Node 18+ for global fetch
-if (typeof fetch !== 'function') {
-    logError('This script requires Node.js v18+ with global fetch.');
-    process.exit(1);
+// Ensure Node 20+ (maintained LTS) for global fetch and modern APIs
+{
+    const major = Number.parseInt(String(process.versions.node || '0').split('.')[0], 10);
+    if (!Number.isFinite(major) || major < 20 || typeof fetch !== 'function') {
+        logError('This script requires Node.js v20+ (maintained LTS) with global fetch.');
+        process.exit(1);
+    }
 }
 
-const ORIGIN = 'https://maktabkhooneh.org';
+const ORIGIN = TRUSTED_ORIGIN;
 
 // Node fetch headers must be ByteString; percent-encode non-ASCII URLs (e.g. Persian slugs).
 function toHeaderSafeUrl(url) {
@@ -246,21 +208,19 @@ function toHeaderSafeUrl(url) {
     }
 }
 
-// Build common headers for authenticated requests.
-function commonHeaders(referer) {
-    /** @type {Record<string,string>} */
-    const headers = {
-        'accept': '*/*',
-        'accept-language': 'en-US,en;q=0.9,fa;q=0.8',
-        'cache-control': 'no-cache',
-        'pragma': 'no-cache',
-        'x-requested-with': 'XMLHttpRequest',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36',
-    };
+/**
+ * Headers for a request. Auth cookies are attached ONLY for the trusted origin.
+ * Pass the request URL so media/CDN hosts never receive session cookies.
+ */
+function commonHeaders(referer, requestUrl = ORIGIN) {
     const ck = ACTIVE_COOKIE || COOKIE;
-    if (ck && ck !== 'PUT_YOUR_COOKIE_HERE') headers['cookie'] = ck;
-    if (referer) headers['referer'] = toHeaderSafeUrl(referer);
-    return headers;
+    return buildAuthAwareHeaders({
+        cookie: ck,
+        referer,
+        url: requestUrl || ORIGIN,
+        trustedOrigin: ORIGIN,
+        accept: '*/*'
+    });
 }
 
 // Human-friendly byte formatter
@@ -307,7 +267,7 @@ function ensureCookiePresent() {
 // CLI usage
 function printUsage() {
     // Header section
-    console.log(`${paintBoldCyan('Maktabkhooneh Downloader')} - ${paintYellow('version 1.0.0')} ${paint(COLOR.dim, '© 2025')}`);
+    console.log(`${paintBoldCyan('Maktabkhooneh Downloader')} - ${paintYellow('version 1.1.0')} ${paint(COLOR.dim, '© 2025')}`);
     console.log(paint(COLOR.magenta, 'By ') + paint(COLOR.magenta, '@NabiKAZ') + ' ' + paintLightBlue('<www.nabi.ir>') + ' ' + paintGreen('<nabikaz@gmail.com>') + ' ' + paintLightBlue('<x.com/NabiKAZ>'));
     console.log(paint(COLOR.dim, 'Signup: ') + paintLightBlue('https://maktabkhooneh.org/'));
     console.log(paint(COLOR.dim, 'Project: ') + paintLightBlue('https://github.com/NabiKAZ/maktabkhooneh-downloader'));
@@ -351,182 +311,39 @@ function printUsage() {
     console.log('');
 }
 
-function parseNumberSpec(spec) {
-    if (!spec || !String(spec).trim()) return null;
-    const out = new Set();
-    const parts = String(spec).split(',').map(s => s.trim()).filter(Boolean);
-    for (const p of parts) {
-        const m = p.match(/^(\d+)\s*-\s*(\d+)$/);
-        if (m) {
-            const a = parseInt(m[1], 10);
-            const b = parseInt(m[2], 10);
-            if (a <= 0 || b <= 0) throw new Error(`Invalid range: ${p}`);
-            const [start, end] = a <= b ? [a, b] : [b, a];
-            for (let i = start; i <= end; i++) out.add(i);
-            continue;
-        }
-        if (!/^\d+$/.test(p)) throw new Error(`Invalid number token: ${p}`);
-        const n = parseInt(p, 10);
-        if (n <= 0) throw new Error(`Invalid number: ${p}`);
-        out.add(n);
-    }
-    return out;
-}
-
 function parseCLI(config = {}, configPath = DEFAULT_CONFIG_FILE) {
     const args = process.argv.slice(2);
-    let inputCourseRef = null;
-    let sampleBytesToDownload = parseNonNegativeInt(config.sampleBytes, DEFAULT_SAMPLE_BYTES);
-    let isVerboseLoggingEnabled = !!config.verbose;
-    let isDryRun = !!config.dryRun;
-    let chapterSpec = config.chapter ?? null;
-    let lessonSpec = config.lesson ?? null;
-    let forceLogin = !!config.forceLogin;
-    let positionalCourseSet = false;
-    for (let i = 0; i < args.length; i++) {
-        const a = args[i];
-        if (a === '--help' || a === '-h') {
-            printUsage();
-            process.exit(0);
-        } else if (a === '--config') {
-            if (args[i + 1]) i++;
-            continue;
-        } else if (a.startsWith('--config=')) {
-            continue;
-        } else if (a.startsWith('--sample-bytes=')) {
-            const v = a.split('=')[1];
-            sampleBytesToDownload = parseInt(v, 10) || 0;
-        } else if (a === '--sample-bytes') {
-            const v = args[i + 1];
-            if (v) {
-                sampleBytesToDownload = parseInt(v, 10) || 0;
-                i++;
-            }
-        } else if (a === '--chapter') {
-            const v = args[i + 1];
-            if (v) {
-                chapterSpec = v;
-                i++;
-            }
-        } else if (a.startsWith('--chapter=')) {
-            chapterSpec = a.split('=')[1];
-        } else if (a === '--lesson') {
-            const v = args[i + 1];
-            if (v) {
-                lessonSpec = v;
-                i++;
-            }
-        } else if (a.startsWith('--lesson=')) {
-            lessonSpec = a.split('=')[1];
-        } else if (a === '--verbose' || a === '-v') {
-            isVerboseLoggingEnabled = true;
-        } else if (a === '--dry-run') {
-            isDryRun = true;
-        } else if (a === '--force-login') {
-            forceLogin = true;
-        } else if (!positionalCourseSet) {
-            inputCourseRef = a;
-            positionalCourseSet = true;
-        }
-    }
-    const chapterSpecText = Array.isArray(chapterSpec) ? chapterSpec.join(',') : chapterSpec;
-    const lessonSpecText = Array.isArray(lessonSpec) ? lessonSpec.join(',') : lessonSpec;
-    const selectedChapters = parseNumberSpec(chapterSpecText);
-    const selectedLessons = parseNumberSpec(lessonSpecText);
-    return {
-        inputCourseRef,
-        sampleBytesToDownload,
-        isVerboseLoggingEnabled,
-        isDryRun,
-        forceLogin,
-        selectedChapters,
-        selectedLessons,
+    const parsed = parseArgv(args, {
+        sampleBytes: parseNonNegativeInt(config.sampleBytes, DEFAULT_SAMPLE_BYTES),
+        verbose: !!config.verbose,
+        dryRun: !!config.dryRun,
+        chapter: config.chapter ?? null,
+        lesson: config.lesson ?? null,
+        forceLogin: !!config.forceLogin,
         configPath
+    });
+    if (parsed.help) {
+        printUsage();
+        process.exit(0);
+    }
+    return {
+        inputCourseRef: parsed.inputCourseRef,
+        sampleBytesToDownload: parsed.sampleBytesToDownload,
+        isVerboseLoggingEnabled: parsed.isVerboseLoggingEnabled,
+        isDryRun: parsed.isDryRun,
+        forceLogin: parsed.forceLogin,
+        selectedChapters: parsed.selectedChapters,
+        selectedLessons: parsed.selectedLessons,
+        configPath: parsed.configPath || configPath
     };
 }
 
 function createVerboseLogger(isVerbose) {
     return {
         verbose: (...a) => {
-            if (isVerbose) console.log(...a);
+            if (isVerbose) console.log(...safeLogArgs(a));
         }
     };
-}
-
-// Parse the course slug from the full course URL.
-// Supports /course/<slug>/ and /lms/course/<slug>/unit/<unit_id>/.
-function extractCourseSlug(courseUrl) {
-    try {
-        const parsed = new URL(courseUrl);
-        if (parsed.origin !== ORIGIN) {
-            throw new Error(buildActionableError(
-                'URL_ORIGIN',
-                `Unexpected origin: ${parsed.origin}. Only ${ORIGIN} is supported.`,
-                `Use a full course URL like: ${ACTIONABLE_URL_PLACEHOLDER}`
-            ));
-        }
-        const parts = parsed.pathname.split('/').filter(Boolean);
-        const lmsIdx = parts.indexOf('lms');
-        if (lmsIdx !== -1 && parts[lmsIdx + 1] === 'course' && parts[lmsIdx + 2]) {
-            return parts[lmsIdx + 2];
-        }
-        const idx = parts.indexOf('course');
-        if (idx === -1 || !parts[idx + 1]) {
-            throw new Error(buildActionableError(
-                'URL_FORMAT',
-                'Cannot parse course slug from URL path.',
-                [
-                    `Expected: ${ACTIONABLE_URL_PLACEHOLDER}`,
-                    'Or LMS: https://maktabkhooneh.org/lms/course/<slug>/unit/<unit_id>/'
-                ]
-            ));
-        }
-        return parts[idx + 1];
-    } catch (e) {
-        if (String(e?.message || '').includes('[URL_')) {
-            throw e;
-        }
-        throw new Error(buildActionableError(
-            'URL_INVALID',
-            `Invalid course URL: ${e.message}`,
-            `Example: node download.mjs "${ACTIONABLE_URL_PLACEHOLDER}"`
-        ));
-    }
-}
-
-// Numeric course id from slug suffix "...-mk10645".
-function extractCourseIdFromSlug(slug) {
-    const m = String(slug || '').match(/-mk(\d+)$/i);
-    return m ? Number.parseInt(m[1], 10) : null;
-}
-
-function getChapterUnits(chapter) {
-    if (Array.isArray(chapter?.units)) return chapter.units;
-    if (Array.isArray(chapter?.unit_set)) return chapter.unit_set;
-    return [];
-}
-
-function isUnitActive(unit) {
-    return !unit || !('status' in unit) || !!unit.status;
-}
-
-// Old API: type === 'lecture'; LMS/outline: type === 1
-function isVideoLecture(unit) {
-    return unit?.type === 1 || unit?.type === 'lecture';
-}
-
-function isUnitLocked(unit) {
-    return unit?.locked === true;
-}
-
-function detectNewUnitFormat(chapters, urlHint = false) {
-    const firstUnit = getChapterUnits(chapters?.[0] || {})[0];
-    if (firstUnit) return typeof firstUnit.type === 'number';
-    return !!urlHint;
-}
-
-function unitIdOf(unit) {
-    return unit?.id || unit?.unit_id || null;
 }
 
 // Fetch with timeout.
@@ -573,63 +390,32 @@ function ensureTrailingSlash(u) {
     return u.endsWith('/') ? u : u + '/';
 }
 
-// Try to detect remote file size and whether server supports Range
+// Try to detect remote file size and whether server supports Range (auth cookies only for trusted origin).
 async function getRemoteSizeAndRanges(url, referer) {
-    // HEAD first
-    try {
-        const res = await fetchWithRetry(url, {
-            method: 'HEAD',
-            headers: {...commonHeaders(referer), accept: '*/*'}
-        }, {retries: RUNTIME_CONFIG.retryAttempts, timeoutMs: RUNTIME_CONFIG.requestTimeoutMs});
-        if (res.ok) {
-            const len = res.headers.get('content-length');
-            const size = len ? parseInt(len, 10) : undefined;
-            const acceptRanges = (res.headers.get('accept-ranges') || '').toLowerCase().includes('bytes');
-            return {size, acceptRanges};
-        }
-    } catch {
-    }
-    // Fallback: GET single byte
-    try {
-        const res = await fetchWithRetry(url, {
-            method: 'GET',
-            headers: {...commonHeaders(referer), range: 'bytes=0-0', accept: '*/*'}
-        }, {retries: RUNTIME_CONFIG.retryAttempts, timeoutMs: RUNTIME_CONFIG.requestTimeoutMs});
-        if (res.status === 206) {
-            const cr = res.headers.get('content-range');
-            // e.g. bytes 0-0/123456
-            const m = cr && cr.match(/\/(\d+)$/);
-            const size = m ? parseInt(m[1], 10) : undefined;
-            try {
-                if (res.body) {
-                    const rb = Readable.fromWeb(res.body);
-                    rb.resume();
-                }
-            } catch {
-            }
-            return {size, acceptRanges: true};
-        }
-    } catch {
-    }
-    return {size: undefined, acceptRanges: false};
+    return probeRemoteSize(url, {
+        cookie: ACTIVE_COOKIE || COOKIE,
+        referer,
+        retries: RUNTIME_CONFIG.retryAttempts,
+        requestTimeoutMs: RUNTIME_CONFIG.requestTimeoutMs,
+        trustedOrigin: ORIGIN,
+        fetchFn: async (u, init, timeoutMs) => fetchWithTimeout(u, init, timeoutMs)
+    });
 }
 
 function cookieValue(name) {
-    const ck = ACTIVE_COOKIE || COOKIE || '';
-    const m = String(ck).match(new RegExp(`(?:^|;\\s*)${name}=([^;]*)`));
-    return m ? decodeURIComponent(m[1]) : null;
+    return cookieValueFromHeader(ACTIVE_COOKIE || COOKIE || '', name);
 }
 
 // LMS video APIs return 403 until the account is enrolled on the course (idempotent).
 async function ensureCourseEnrollment(courseSlug, referer) {
+    const apiUrl = `${ORIGIN}/api/v1/courses/${courseSlug}/enroll/`;
     const headers = {
-        ...commonHeaders(referer),
+        ...commonHeaders(referer, apiUrl),
         accept: 'application/json',
         'content-type': 'application/json'
     };
     const csrf = cookieValue('csrftoken');
     if (csrf) headers['X-CSRFToken'] = csrf;
-    const apiUrl = `${ORIGIN}/api/v1/courses/${courseSlug}/enroll/`;
     const res = await fetchWithRetry(apiUrl, {method: 'POST', headers, body: '{}'});
     if (!res.ok) {
         throw new Error(buildActionableError(
@@ -697,22 +483,10 @@ async function fetchUnitVideoUrl(unitId, referer) {
     const apiUrl = `${ORIGIN}/api/v1/lms/units/${unitId}/video_url/`;
     const res = await fetchWithRetry(apiUrl, {
         method: 'GET',
-        headers: {...commonHeaders(referer), accept: 'application/json'}
+        headers: {...commonHeaders(referer, apiUrl), accept: 'application/json'}
     });
     if (!res.ok) throw new Error(explainHttpFailure(res.status, 'Fetch unit video URL'));
     return res.json();
-}
-
-function pickBestVideoUrl(videoUrlData) {
-    if (!videoUrlData) return null;
-    const qualities = Array.isArray(videoUrlData.qualities) ? videoUrlData.qualities : [];
-    if (qualities.length > 0) {
-        const sorted = [...qualities].sort((a, b) => (b.resolution || 0) - (a.resolution || 0));
-        const withUrl = sorted.find(q => q.download_url);
-        if (withUrl) return withUrl.download_url;
-    }
-    const v = videoUrlData.video_urls;
-    return v?.hq || v?.lq || null;
 }
 
 async function resolveLmsUnitMedia(unitId, referer) {
@@ -846,20 +620,6 @@ function pickBestSource(urls) {
     if (!urls || urls.length === 0) return null;
     const hq = urls.find(u => /\/videos\/hq\d+/.test(u) || u.includes('/videos/hq'));
     return hq || urls[0];
-}
-
-// Sanitize a string for safe Windows filenames.
-function sanitizeName(name) {
-    return name.replace(/[\/:*?"<>|]/g, ' ').replace(/[\s\u200c\u200f\u202a\u202b]+/g, ' ').trim().slice(0, 150);
-}
-
-function normalizeCourseFolderNameFromSlug(courseSlug) {
-    const decoded = decodeURIComponent(courseSlug || '');
-    // Remove trailing course id token like "-mk748" / "-MK12345"
-    const withoutMkId = decoded.replace(/-mk\d+\s*$/i, '');
-    // Replace slug separators with spaces for cleaner folder names
-    const spaced = withoutMkId.replace(/[-_]+/g, ' ');
-    return sanitizeName(spaced);
 }
 
 // Extract attachment links from lecture HTML.
@@ -1222,7 +982,7 @@ async function prepareSession({userEmail, userPassword, verbose, courseUrl, forc
             if (ACTIVE_COOKIE) {
                 authCfg.sessionCookie = ACTIVE_COOKIE;
                 authCfg.sessionUpdated = new Date().toISOString();
-                await saveConfigFile(configPath, config);
+                await persistConfig(configPath, config);
                 logSuccess('Login success; session saved to config.auth.sessionCookie');
             }
             const core = await verify();
@@ -1260,214 +1020,52 @@ function extractSubtitleLinks(html) {
     return Array.from(results);
 }
 
-// Download a URL to a file (with retries). If sampleBytes > 0, request a Range and buffer the small payload.
-// label: optional display name to show in the progress line (e.g., final file name)
-async function downloadToFile(url, filePath, referer, maxRetries = RUNTIME_CONFIG.retryAttempts, sampleBytes = 0, label = '') {
-    // Skip if already exists with non-zero size
-    let existingFinalSize = 0;
+// Download a URL to a file via hardened streaming engine (auth cookies origin-scoped).
+async function downloadToFile(url, filePath, referer, maxRetries = RUNTIME_CONFIG.retryAttempts, sampleBytes = 0, label = '', expectedKind = 'video', outputRoot = null) {
+    const isTTY = process.stdout.isTTY;
+    const truncate = (s, max = 70) => {
+        if (!s) return '';
+        const str = stripControlChars(String(s));
+        return str.length > max ? str.slice(0, max - 1) + '…' : str;
+    };
+    const render = (ratio, downloadedBytes, expectedTotal, name) => {
+        if (!isTTY && ratio < 1) return;
+        const bar = buildProgressBar(ratio || 0);
+        const pct = expectedTotal ? `${(Math.min(1, ratio || 0) * 100).toFixed(1)}%` : (ratio >= 1 ? '100.0%' : '--%');
+        const sizeStr = `${formatBytes(downloadedBytes)}${expectedTotal ? ' / ' + formatBytes(expectedTotal) : ''}`;
+        const nm = name ? `  -  ${truncate(name, 80)}` : '';
+        const line = `  ⬇️  [${bar}] ${pct}  ${sizeStr}${nm}`;
+        if (isTTY) process.stdout.write(`\r${line}`);
+        else if (ratio >= 1) process.stdout.write(`${line}\n`);
+    };
     try {
-        const stat = fs.statSync(filePath);
-        existingFinalSize = stat.size;
-        if (existingFinalSize > 0 && sampleBytes > 0) return 'exists';
-    } catch {
-    }
-    const tmpPath = filePath + '.part';
-    let existingTmpSize = 0;
-    try {
-        const stat = fs.statSync(tmpPath);
-        existingTmpSize = stat.size;
-    } catch {
-    }
-
-    // For full downloads, see if final is already complete
-    let remoteInfo;
-    if (sampleBytes === 0 && existingFinalSize > 0) {
-        remoteInfo = await getRemoteSizeAndRanges(url, referer);
-        if (remoteInfo.size && existingFinalSize >= remoteInfo.size) {
-            return 'exists';
-        }
-    }
-
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        try {
-            // Decide resume offset
-            let resumeOffset = 0;
-            let writingTo = tmpPath;
-            if (sampleBytes > 0) {
-                resumeOffset = 0; // do not resume sample downloads
-            } else {
-                if (existingTmpSize > 0) {
-                    resumeOffset = existingTmpSize;
-                } else if (existingFinalSize > 0) {
-                    // Only resume from final if server supports ranges
-                    if (!remoteInfo) remoteInfo = await getRemoteSizeAndRanges(url, referer);
-                    if (remoteInfo.acceptRanges) {
-                        // Move final to tmp to resume appending
-                        try {
-                            await fs.promises.rename(filePath, tmpPath);
-                            existingTmpSize = existingFinalSize;
-                            resumeOffset = existingFinalSize;
-                            existingFinalSize = 0;
-                        } catch {
-                        }
-                    } else {
-                        // Cannot resume; start from scratch
-                        resumeOffset = 0;
-                    }
-                }
+        const status = await engineDownloadToFile(url, filePath, {
+            cookie: ACTIVE_COOKIE || COOKIE,
+            referer,
+            maxRetries,
+            sampleBytes,
+            label,
+            expectedKind,
+            outputRoot,
+            deps: {
+                trustedOrigin: ORIGIN,
+                requestTimeoutMs: RUNTIME_CONFIG.requestTimeoutMs,
+                readTimeoutMs: RUNTIME_CONFIG.readTimeoutMs,
+                onWarn: (m) => logWarn(m),
+                onProgress: (ratio, got, total, name) => render(ratio, got, total, name || label),
+                fetchFn: async (u, init, timeoutMs) => fetchWithTimeout(u, init, timeoutMs)
             }
-
-            const requestInit = {
-                method: 'GET',
-                headers: {...commonHeaders(referer), accept: 'video/mp4,application/octet-stream,*/*'}
-            };
-            if (sampleBytes && sampleBytes > 0) {
-                requestInit.headers['range'] = `bytes=0-${Math.max(0, sampleBytes - 1)}`;
-            } else if (resumeOffset > 0) {
-                requestInit.headers['range'] = `bytes=${resumeOffset}-`;
-            }
-
-            const controller = new AbortController();
-            const to = setTimeout(() => controller.abort(), RUNTIME_CONFIG.requestTimeoutMs);
-            const res = await fetch(url, {...requestInit, signal: controller.signal});
-            if (!res.ok || !res.body) throw new Error(explainHttpFailure(res.status, 'Download'));
-            if (resumeOffset > 0 && res.status !== 206) {
-                // Server didn't honor Range; restart from 0
-                try {
-                    await fs.promises.unlink(tmpPath);
-                } catch {
-                }
-                existingTmpSize = 0;
-                resumeOffset = 0;
-                clearTimeout(to);
-                throw new Error('Server did not honor range; restarting from 0');
-            }
-
-            await fs.promises.mkdir(path.dirname(filePath), {recursive: true});
-
-            // Sample mode: Range already requested. Buffer the small payload to avoid
-            // stream abort races that truncate the on-disk file.
-            if (sampleBytes && sampleBytes > 0) {
-                const raw = Buffer.from(await res.arrayBuffer());
-                clearTimeout(to);
-                const out = raw.subarray(0, Math.min(raw.length, sampleBytes));
-                await fs.promises.writeFile(filePath, out);
-                process.stdout.write(`  ⬇️  [${buildProgressBar(1)}] 100.0%  ${formatBytes(out.length)} / ${formatBytes(sampleBytes)}\n`);
-                return 'downloaded';
-            }
-
-            const write = fs.createWriteStream(writingTo, {flags: resumeOffset === 0 ? 'w' : 'a'});
-            const readable = Readable.fromWeb(res.body);
-            let readIdleTimer = null;
-            const resetReadTimeout = () => {
-                if (readIdleTimer) clearTimeout(readIdleTimer);
-                readIdleTimer = setTimeout(() => {
-                    try {
-                        controller.abort();
-                    } catch {
-                    }
-                }, RUNTIME_CONFIG.readTimeoutMs);
-            };
-            resetReadTimeout();
-
-            // Progress bar state
-            const contentLengthHeader = res.headers.get('content-length');
-            const fullLength = contentLengthHeader ? parseInt(contentLengthHeader, 10) : undefined;
-            // Try content-range for total size when resuming
-            let expectedTotal;
-            const contentRange = res.headers.get('content-range');
-            const crMatch = contentRange && contentRange.match(/\/(\d+)$/);
-            if (crMatch) expectedTotal = parseInt(crMatch[1], 10);
-            else if (fullLength && resumeOffset > 0) expectedTotal = resumeOffset + fullLength;
-            else expectedTotal = fullLength;
-            let downloadedBytes = resumeOffset;
-            const startedAt = Date.now();
-
-            // Progress render helper
-            const truncate = (s, max = 70) => {
-                if (!s) return '';
-                const str = String(s);
-                return str.length > max ? str.slice(0, max - 1) + '…' : str;
-            };
-            const render = (final = false) => {
-                const elapsedSec = Math.max(0.001, (Date.now() - startedAt) / 1000);
-                const speed = downloadedBytes / elapsedSec;
-                // clamp bytes to expected total when finalizing or very close (to avoid 99.9% stuck)
-                let shownDownloaded = downloadedBytes;
-                if (expectedTotal && (final || downloadedBytes > expectedTotal)) {
-                    // Tolerate tiny overflow due to headers/rounding
-                    const overflow = downloadedBytes - expectedTotal;
-                    if (overflow <= 65536) shownDownloaded = expectedTotal;
-                }
-                // Decide ratio; if final, force full bar
-                let ratio = 0;
-                if (final) {
-                    ratio = 1;
-                } else if (expectedTotal) {
-                    ratio = (shownDownloaded / expectedTotal);
-                } else {
-                    ratio = 0; // unknown total
-                }
-                const bar = buildProgressBar(ratio);
-                const pct = final ? '100.0%' : (expectedTotal ? `${(Math.min(1, ratio) * 100).toFixed(1)}%` : '--%');
-                const sizeStr = `${formatBytes(shownDownloaded)}${expectedTotal ? ' / ' + formatBytes(expectedTotal) : ''}`;
-                const name = label ? `  -  ${truncate(label, 80)}` : '';
-                const line = `  ⬇️  [${bar}] ${pct}  ${sizeStr}  ${formatSpeed(speed)}${name}`;
-                process.stdout.write(`\r${line}`);
-            };
-
-            // Counting transform
-            const counter = new Transform({
-                transform(chunk, _enc, cb) {
-                    resetReadTimeout();
-                    downloadedBytes += chunk.length;
-                    // throttle render slightly by size steps
-                    if (downloadedBytes === chunk.length || downloadedBytes % 65536 < 8192) render();
-                    cb(null, chunk);
-                }
-            });
-            try {
-                await pipeline(readable, counter, write);
-            } catch (pipeErr) {
-                throw pipeErr;
-            } finally {
-                clearTimeout(to);
-                if (readIdleTimer) clearTimeout(readIdleTimer);
-            }
-
-            // finalize progress bar to 100%
-            try {
-                render(true);
-            } catch {
-            }
-            process.stdout.write('\n');
-            try {
-                await fs.promises.rename(tmpPath, filePath);
-            } catch (e) {
-                try {
-                    await fs.promises.copyFile(writingTo, filePath);
-                } catch {
-                }
-            }
-            try {
-                await fs.promises.unlink(tmpPath);
-            } catch {
-            }
-            return 'downloaded';
-        } catch (err) {
+        });
+        if (isTTY) process.stdout.write('\n');
+        return status;
+    } catch (err) {
+        if (isTTY) {
             try {
                 process.stdout.write('\n');
             } catch {
             }
-            // Keep .part file for future resume; do not delete on error
-            const retryable = isRetriableNetworkError(err) || /HTTP (408|425|429|5\d\d)/.test(String(err?.message || ''));
-            if (attempt < maxRetries && retryable) {
-                logWarn(`Retry ${attempt}/${maxRetries} for ${path.basename(filePath)} after error: ${err.message}`);
-                await sleep(toBackoffMs(attempt));
-                continue;
-            }
-            throw err;
         }
+        throw err;
     }
 }
 
@@ -1525,11 +1123,7 @@ async function main() {
     } else {
         COOKIE = 'PUT_YOUR_COOKIE_HERE';
     }
-    RUNTIME_CONFIG = {
-        retryAttempts: parsePositiveInt(runtimeCfg.retryAttempts, DEFAULT_RETRY_ATTEMPTS),
-        requestTimeoutMs: parsePositiveInt(runtimeCfg.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS),
-        readTimeoutMs: parsePositiveInt(runtimeCfg.readTimeoutMs, DEFAULT_READ_TIMEOUT_MS)
-    };
+    RUNTIME_CONFIG = validateRuntimeConfig(runtimeCfg);
     const userEmail = LOGIN_EMAIL || null;
     const userPassword = LOGIN_PASSWORD || null;
     const {verbose} = createVerboseLogger(isVerboseLoggingEnabled);
@@ -1537,7 +1131,17 @@ async function main() {
         printUsage();
         process.exit(1);
     }
-    const baseUrl = normalizeBaseUrl(courseCfg.baseUrl || `${ORIGIN}/course/`);
+    let baseUrl;
+    try {
+        baseUrl = validateCourseBaseUrl(courseCfg.baseUrl || `${ORIGIN}/course/`);
+    } catch (e) {
+        logError(buildActionableError(
+            'CONFIG_BASEURL',
+            e.message,
+            'Set course.baseUrl to https://maktabkhooneh.org/course/'
+        ));
+        process.exit(1);
+    }
     const resolvedCourseUrl = isLikelyFullUrl(inputCourseRef)
         ? String(inputCourseRef).trim()
         : buildCourseUrlFromSlug(baseUrl, inputCourseRef);
@@ -1674,7 +1278,9 @@ async function main() {
             const chapter = chapters[chapterIndex];
             const chapterNo = chapterIndex + 1;
             if (selectedChapters && !selectedChapters.has(chapterNo)) continue;
-            const chapterFolder = path.join(outputRootFolder, `فصل ${chapterNo} - ${sanitizeName(chapter.title || chapter.slug || 'chapter')}`);
+            const chapterFolderName = `فصل ${chapterNo} - ${sanitizeName(chapter.title || chapter.slug || 'chapter')}`;
+            const chapterFolder = path.join(outputRootFolder, chapterFolderName);
+            assertOutputPathSafe(outputRootFolder, chapterFolder);
             const units = getChapterUnits(chapter);
             let chapterLectureNo = 0;
             let chapterKnownBytes = 0;
@@ -1799,7 +1405,9 @@ async function main() {
             const chapter = chapters[chapterIndex];
             const chapterNo = chapterIndex + 1;
             if (selectedChapters && !selectedChapters.has(chapterNo)) continue;
-            const chapterFolder = path.join(outputRootFolder, `فصل ${chapterNo} - ${sanitizeName(chapter.title || chapter.slug || 'chapter')}`);
+            const chapterFolderName = `فصل ${chapterNo} - ${sanitizeName(chapter.title || chapter.slug || 'chapter')}`;
+            const chapterFolder = path.join(outputRootFolder, chapterFolderName);
+            assertOutputPathSafe(outputRootFolder, chapterFolder);
             console.log(`📖 Chapter ${chapterIndex + 1}/${chapters.length}: ${paintBold(chapter.title || chapter.slug)}`);
 
             const units = getChapterUnits(chapter);
@@ -1840,7 +1448,7 @@ async function main() {
 
                     // Print the filename on its own line; progress bar will render on the next line
                     console.log(`📥 Downloading: ${finalFileName}`);
-                    const status = await downloadToFile(bestSourceUrl, outputFilePath, lectureUrl, RUNTIME_CONFIG.retryAttempts, sampleBytesToDownload, '');
+                    const status = await downloadToFile(bestSourceUrl, outputFilePath, lectureUrl, RUNTIME_CONFIG.retryAttempts, sampleBytesToDownload, '', 'video', outputRootFolder);
                     if (status === 'exists') {
                         console.log(paintYellow(`🟡 SKIP exists: ${finalFileName}`));
                         skippedCount++;
@@ -1875,7 +1483,7 @@ async function main() {
                                         continue;
                                     }
                                     console.log(`📝 Subtitle: ${subtitleName}`);
-                                    const sStatus = await downloadToFile(absUrl, subtitlePath, lectureUrl, RUNTIME_CONFIG.retryAttempts, 0, '');
+                                    const sStatus = await downloadToFile(absUrl, subtitlePath, lectureUrl, RUNTIME_CONFIG.retryAttempts, 0, '', 'subtitle', outputRootFolder);
                                     if (sStatus === 'exists') console.log(paintYellow(`🟡 Subtitle exists: ${subtitleName}`));
                                     else logSuccess(`SUBTITLE: ${subtitleName}`);
                                     await sleep(150);
@@ -1901,15 +1509,16 @@ async function main() {
                                     } catch {
                                         filePart = attUrl.split('?')[0].split('/').pop() || 'attachment.bin';
                                     }
-                                    const sanitizedAttachment = sanitizeName(filePart);
+                                    const sanitizedAttachment = sanitizeContentDispositionFilename(filePart, 'attachment.bin');
                                     const finalAttachmentName = `${videoBaseNoExt} - ${sanitizedAttachment}`;
                                     const attachmentPath = path.join(chapterFolder, finalAttachmentName);
+                                    assertOutputPathSafe(outputRootFolder, attachmentPath);
                                     if (fs.existsSync(attachmentPath) && fs.statSync(attachmentPath).size > 0) {
                                         console.log(paintYellow(`🟡 Attachment exists: ${finalAttachmentName}`));
                                         continue;
                                     }
                                     console.log(`📎 Attachment: ${finalAttachmentName}`);
-                                    const aStatus = await downloadToFile(attUrl, attachmentPath, lectureUrl, RUNTIME_CONFIG.retryAttempts, 0, '');
+                                    const aStatus = await downloadToFile(attUrl, attachmentPath, lectureUrl, RUNTIME_CONFIG.retryAttempts, 0, '', 'attachment', outputRootFolder);
                                     if (aStatus === 'exists') console.log(paintYellow(`🟡 Attachment exists: ${finalAttachmentName}`));
                                     else logSuccess(`ATTACHMENT: ${finalAttachmentName}`);
                                     await sleep(200);
@@ -1957,6 +1566,14 @@ async function main() {
 }
 
 main().catch(err => {
+    if (/Invalid (range|number token|number)|Unknown option|Missing value|Invalid --/.test(String(err?.message || ''))) {
+        logError(buildActionableError(
+            'CLI_INPUT',
+            err.message,
+            'Examples: --chapter 2 | --chapter 1,3 | --chapter 2-4 | --lesson 2-5,9 | --sample-bytes 65536'
+        ));
+        process.exit(2);
+    }
     if (/Invalid (range|number token|number)/.test(String(err?.message || ''))) {
         logError(buildActionableError(
             'FILTER_FORMAT',
@@ -1965,7 +1582,7 @@ main().catch(err => {
         ));
         process.exit(2);
     }
-    const rawMsg = String(err?.message || err || '');
+    const rawMsg = redactSecrets(String(err?.message || err || ''), secretBag());
     if (/^\[[A-Z0-9_]+\]/.test(rawMsg) && rawMsg.includes('Next step:')) {
         logError(rawMsg);
         process.exit(1);

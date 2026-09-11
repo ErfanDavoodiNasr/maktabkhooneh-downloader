@@ -5,9 +5,9 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
-package-lock.json
-yarn.lock
-pnpm-lock.yaml
+
+# Keep lockfiles tracked — do not ignore them
+# (removed package-lock.json ignore)
 
 # OS
 .DS_Store
@@ -16,7 +16,9 @@ Thumbs.db
 # Output
 download/
 *.part
+.coverage
 
+# History / local scratch
 .history/
 docs/
 backup/
@@ -24,6 +26,7 @@ New Text Document.txt
 signup/
 
 # Local secrets / test configs
+# Keep empty config.json committed; only *.local.json is ignored.
 *.local.json
 .test-config.local.json
 

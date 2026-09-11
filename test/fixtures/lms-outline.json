@@ -1,0 +1,43 @@
+{
+  "chapters": [
+    {
+      "title": "Chapter 1",
+      "units": [
+        {
+          "id": 1,
+          "title": "Video A",
+          "type": 1,
+          "locked": false
+        },
+        {
+          "id": 2,
+          "title": "Locked video",
+          "type": 1,
+          "locked": true
+        },
+        {
+          "id": 3,
+          "title": "Quiz",
+          "type": 2,
+          "locked": false
+        },
+        {
+          "id": 4,
+          "title": "Video B",
+          "type": 1,
+          "locked": false
+        }
+      ]
+    },
+    {
+      "title": "Chapter 2",
+      "units": [
+        {
+          "unit_id": 10,
+          "title": "Only video",
+          "type": 1
+        }
+      ]
+    }
+  ]
+}

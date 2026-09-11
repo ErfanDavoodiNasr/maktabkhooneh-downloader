@@ -3,7 +3,7 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONFIG_FILE="$PROJECT_DIR/config.json"
-MIN_NODE_MAJOR=18
+MIN_NODE_MAJOR=20
 EXAMPLE_SLUG='آموزش-گیت-جادی-mk12029'
 
 log() { printf '[install] %s\n' "$*"; }

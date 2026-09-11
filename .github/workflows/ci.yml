@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, Node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest, windows-latest ]
+        node: [ 20, 22 ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Install (no deps required; generate lockfile hygiene)
+        run: npm install --package-lock-only || npm install
+      - name: Unit + integration (release gate)
+        run: npm run test:release
+      - name: Coverage
+        if: matrix.os == 'ubuntu-latest' && matrix.node == '22'
+        run: npm run test:coverage
+
+  live-smoke:
+    name: live smoke (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Write live config from secrets
+        env:
+          MKD_EMAIL: ${{ secrets.MKD_EMAIL }}
+          MKD_PASSWORD: ${{ secrets.MKD_PASSWORD }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const cfg = {
+              course: { baseUrl: "https://maktabkhooneh.org/course/" },
+              auth: {
+                email: process.env.MKD_EMAIL || "",
+                password: process.env.MKD_PASSWORD || "",
+                cookie: "", cookieFile: "", sessionCookie: "", sessionUpdated: ""
+              },
+              runtime: { sampleBytes: 0, retryAttempts: 4, requestTimeoutMs: 30000, readTimeoutMs: 120000 },
+              defaults: { chapter: "", lesson: "", dryRun: false, forceLogin: false, verbose: false }
+            };
+            fs.writeFileSync(".live-config.local.json", JSON.stringify(cfg, null, 2));
+            fs.chmodSync(".live-config.local.json", 0o600);
+          '
+      - name: Live dry-run / sample
+        env:
+          MKD_LIVE: "1"
+          MKD_LIVE_CONFIG: .live-config.local.json
+        run: npm run test:live
+      - name: Scrub secrets from runner
+        if: always()
+        run: rm -f .live-config.local.json
+
+  # workflow_dispatch enablement
+  # (live-smoke only runs when manually dispatched; add workflow_dispatch below)

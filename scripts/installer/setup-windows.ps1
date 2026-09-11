@@ -2,7 +2,7 @@ $ErrorActionPreference = 'Stop'
 
 $ProjectDir = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $ConfigFile = Join-Path $ProjectDir 'config.json'
-$MinNodeMajor = 18
+$MinNodeMajor = 20
 $ExampleSlug = 'آموزش-گیت-جادی-mk12029'
 
 function Log($msg) { Write-Host "[install] $msg" }

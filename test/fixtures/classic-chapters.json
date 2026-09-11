@@ -1,0 +1,44 @@
+{
+  "chapters": [
+    {
+      "title": "فصل اول",
+      "unit_set": [
+        {
+          "id": 101,
+          "title": "درس ۱",
+          "type": "lecture",
+          "status": true
+        },
+        {
+          "id": 102,
+          "title": "درس ۲",
+          "type": "lecture",
+          "status": true
+        },
+        {
+          "id": 103,
+          "title": "غیرفعال",
+          "type": "lecture",
+          "status": false
+        }
+      ]
+    },
+    {
+      "title": "فصل دوم",
+      "unit_set": [
+        {
+          "id": 201,
+          "title": "درس الف",
+          "type": "lecture",
+          "status": true
+        },
+        {
+          "id": 202,
+          "title": "پیوست",
+          "type": "attachment",
+          "status": true
+        }
+      ]
+    }
+  ]
+}

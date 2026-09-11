@@ -1,0 +1,20 @@
+{
+  "name": "maktabkhooneh-downloader",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node download.mjs",
+    "test": "node --test test/unit/*.test.mjs test/integration/*.test.mjs",
+    "test:unit": "node --test test/unit/*.test.mjs",
+    "test:integration": "node --test test/integration/*.test.mjs",
+    "test:coverage": "node --experimental-test-coverage --test test/unit/*.test.mjs test/integration/*.test.mjs",
+    "test:security": "node --test test/unit/security*.test.mjs test/integration/security*.test.mjs test/integration/cookie-leak*.test.mjs",
+    "test:release": "node --test test/unit/*.test.mjs test/integration/*.test.mjs",
+    "test:live": "node --test test/live/*.test.mjs",
+    "test:installers": "node --test test/integration/installers*.test.mjs"
+  }
+}
