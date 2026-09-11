@@ -1,32 +1,42 @@
 /**
  * CLI tool to download all lecture videos of a maktabkhooneh course
- * 
+ *
  * Usage examples:
+ *   node download.mjs "<slug>"
  *   node download.mjs "https://maktabkhooneh.org/course/<slug>/"
- *   node download.mjs "https://maktabkhooneh.org/course/<slug>/" --sample-bytes 65536 --verbose
- * 
+ *   node download.mjs "https://maktabkhooneh.org/lms/course/<slug>/unit/<unit_id>/"
+ *   node download.mjs "<slug>" --sample-bytes 65536 --verbose
+ *
  * Notes: Only download content you have legal rights to access.
- * 
+ *
  * @repository https://github.com/NabiKAZ/maktabkhooneh-downloader
  * @author NabiKAZ <https://x.com/NabiKAZ>
  * @license GPL-3.0
  * @created 2025
- * 
+ *
  * Copyright(C) 2025 NabiKAZ
  */
 
 import fs from 'fs';
 import path from 'path';
-import { Transform, Readable } from 'stream';
-import { pipeline } from 'stream/promises';
-import { setTimeout as sleep } from 'timers/promises';
+import {Readable, Transform} from 'stream';
+import {pipeline} from 'stream/promises';
+import {setTimeout as sleep} from 'timers/promises';
+import https from 'https';
 
 // ===============
 // Console styling (ANSI colors) and emojis
 // ===============
 const COLOR = {
-    reset: '\u001b[0m', bold: '\u001b[1m', dim: '\u001b[2m',
-    red: '\u001b[31m', green: '\u001b[32m', yellow: '\u001b[33m', blue: '\u001b[34m', magenta: '\u001b[35m', cyan: '\u001b[36m',
+    reset: '\u001b[0m',
+    bold: '\u001b[1m',
+    dim: '\u001b[2m',
+    red: '\u001b[31m',
+    green: '\u001b[32m',
+    yellow: '\u001b[33m',
+    blue: '\u001b[34m',
+    magenta: '\u001b[35m',
+    cyan: '\u001b[36m',
     lightBlue: '\u001b[94m'
 };
 const paint = (code, s) => `${code}${s}${COLOR.reset}`;
@@ -69,25 +79,25 @@ function discoverConfigPath(args) {
         const a = args[i];
         if (a === '--config') {
             const v = args[i + 1];
-            return v ? v : DEFAULT_CONFIG_FILE;
+            return {path: v ? v : DEFAULT_CONFIG_FILE, explicit: true};
         }
         if (a.startsWith('--config=')) {
-            return a.slice('--config='.length);
+            return {path: a.slice('--config='.length), explicit: true};
         }
     }
-    return DEFAULT_CONFIG_FILE;
+    return {path: DEFAULT_CONFIG_FILE, explicit: false};
 }
 
 function loadConfigFile(filePath) {
     const resolved = path.resolve(process.cwd(), filePath || DEFAULT_CONFIG_FILE);
-    if (!fs.existsSync(resolved)) return { config: {}, configPath: resolved, exists: false };
+    if (!fs.existsSync(resolved)) return {config: {}, configPath: resolved, exists: false};
     try {
         const txt = fs.readFileSync(resolved, 'utf8');
         const cfg = JSON.parse(txt);
         if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) {
             throw new Error('config root must be a JSON object');
         }
-        return { config: cfg, configPath: resolved, exists: true };
+        return {config: cfg, configPath: resolved, exists: true};
     } catch (e) {
         throw new Error(buildActionableError(
             'CONFIG_PARSE',
@@ -227,6 +237,15 @@ if (typeof fetch !== 'function') {
 
 const ORIGIN = 'https://maktabkhooneh.org';
 
+// Node fetch headers must be ByteString; percent-encode non-ASCII URLs (e.g. Persian slugs).
+function toHeaderSafeUrl(url) {
+    try {
+        return new URL(String(url || ''), ORIGIN).href;
+    } catch {
+        return `${ORIGIN}/`;
+    }
+}
+
 // Build common headers for authenticated requests.
 function commonHeaders(referer) {
     /** @type {Record<string,string>} */
@@ -240,7 +259,7 @@ function commonHeaders(referer) {
     };
     const ck = ACTIVE_COOKIE || COOKIE;
     if (ck && ck !== 'PUT_YOUR_COOKIE_HERE') headers['cookie'] = ck;
-    if (referer) headers['referer'] = referer;
+    if (referer) headers['referer'] = toHeaderSafeUrl(referer);
     return headers;
 }
 
@@ -248,8 +267,12 @@ function commonHeaders(referer) {
 function formatBytes(bytes) {
     if (bytes == null || isNaN(bytes)) return '-';
     const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    let i = 0; let n = Number(bytes);
-    while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+    let i = 0;
+    let n = Number(bytes);
+    while (n >= 1024 && i < units.length - 1) {
+        n /= 1024;
+        i++;
+    }
     return `${n.toFixed(n >= 100 ? 0 : n >= 10 ? 1 : 2)} ${units[i]}`;
 }
 
@@ -270,8 +293,8 @@ function ensureCookiePresent() {
     if (!(ACTIVE_COOKIE && ACTIVE_COOKIE !== 'PUT_YOUR_COOKIE_HERE') && !(COOKIE && COOKIE !== 'PUT_YOUR_COOKIE_HERE')) {
         logError(buildActionableError(
             'SESSION_MISSING',
-                'No active session/cookie found.',
-                [
+            'No active session/cookie found.',
+            [
                 'Set credentials in config.json: auth.email and auth.password',
                 'Or provide cookie in config.json: auth.cookie or auth.cookieFile',
                 `Then run: node download.mjs "${ACTIONABLE_URL_PLACEHOLDER}"`
@@ -297,6 +320,7 @@ function printUsage() {
     // Options
     console.log('\n' + paintBold('Options:'));
     console.log(`  ${paintYellow('[slug|course_url]')}           Course slug (preferred) or full course URL`);
+    console.log(`                                           Supports /course/<slug>/ and /lms/course/<slug>/unit/<id>/`);
     console.log(`  ${paintGreen('--sample-bytes')} ${paintYellow('N')}            Download only the first N bytes of each video`);
     console.log(`  ${paintGreen('--chapter')} ${paintYellow('SPEC')}           Select chapter(s): e.g. 2 or 1,3 or 2-4`);
     console.log(`  ${paintGreen('--lesson')} ${paintYellow('SPEC')}            Select lesson(s) inside selected chapter(s): e.g. 2 or 2-5,9`);
@@ -318,6 +342,7 @@ function printUsage() {
     // Examples
     console.log('\n' + paintBold('Examples:'));
     console.log('  ' + paintCyan('node download.mjs "<slug>"'));
+    console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/lms/course/<slug>/unit/<unit_id>/"'));
     console.log('  ' + paintCyan('node download.mjs "<slug>" --sample-bytes 65536 --verbose'));
     console.log('  ' + paintCyan('node download.mjs "<slug>" --dry-run'));
     console.log('  ' + paintCyan('node download.mjs "<slug>" --chapter 2 --lesson 2-5,9'));
@@ -373,13 +398,24 @@ function parseCLI(config = {}, configPath = DEFAULT_CONFIG_FILE) {
             sampleBytesToDownload = parseInt(v, 10) || 0;
         } else if (a === '--sample-bytes') {
             const v = args[i + 1];
-            if (v) { sampleBytesToDownload = parseInt(v, 10) || 0; i++; }
+            if (v) {
+                sampleBytesToDownload = parseInt(v, 10) || 0;
+                i++;
+            }
         } else if (a === '--chapter') {
-            const v = args[i + 1]; if (v) { chapterSpec = v; i++; }
+            const v = args[i + 1];
+            if (v) {
+                chapterSpec = v;
+                i++;
+            }
         } else if (a.startsWith('--chapter=')) {
             chapterSpec = a.split('=')[1];
         } else if (a === '--lesson') {
-            const v = args[i + 1]; if (v) { lessonSpec = v; i++; }
+            const v = args[i + 1];
+            if (v) {
+                lessonSpec = v;
+                i++;
+            }
         } else if (a.startsWith('--lesson=')) {
             lessonSpec = a.split('=')[1];
         } else if (a === '--verbose' || a === '-v') {
@@ -410,10 +446,15 @@ function parseCLI(config = {}, configPath = DEFAULT_CONFIG_FILE) {
 }
 
 function createVerboseLogger(isVerbose) {
-    return { verbose: (...a) => { if (isVerbose) console.log(...a); } };
+    return {
+        verbose: (...a) => {
+            if (isVerbose) console.log(...a);
+        }
+    };
 }
 
 // Parse the course slug from the full course URL.
+// Supports /course/<slug>/ and /lms/course/<slug>/unit/<unit_id>/.
 function extractCourseSlug(courseUrl) {
     try {
         const parsed = new URL(courseUrl);
@@ -425,12 +466,19 @@ function extractCourseSlug(courseUrl) {
             ));
         }
         const parts = parsed.pathname.split('/').filter(Boolean);
+        const lmsIdx = parts.indexOf('lms');
+        if (lmsIdx !== -1 && parts[lmsIdx + 1] === 'course' && parts[lmsIdx + 2]) {
+            return parts[lmsIdx + 2];
+        }
         const idx = parts.indexOf('course');
         if (idx === -1 || !parts[idx + 1]) {
             throw new Error(buildActionableError(
                 'URL_FORMAT',
                 'Cannot parse course slug from URL path.',
-                `Expected format: ${ACTIONABLE_URL_PLACEHOLDER}`
+                [
+                    `Expected: ${ACTIONABLE_URL_PLACEHOLDER}`,
+                    'Or LMS: https://maktabkhooneh.org/lms/course/<slug>/unit/<unit_id>/'
+                ]
             ));
         }
         return parts[idx + 1];
@@ -446,25 +494,64 @@ function extractCourseSlug(courseUrl) {
     }
 }
 
+// Numeric course id from slug suffix "...-mk10645".
+function extractCourseIdFromSlug(slug) {
+    const m = String(slug || '').match(/-mk(\d+)$/i);
+    return m ? Number.parseInt(m[1], 10) : null;
+}
+
+function getChapterUnits(chapter) {
+    if (Array.isArray(chapter?.units)) return chapter.units;
+    if (Array.isArray(chapter?.unit_set)) return chapter.unit_set;
+    return [];
+}
+
+function isUnitActive(unit) {
+    return !unit || !('status' in unit) || !!unit.status;
+}
+
+// Old API: type === 'lecture'; LMS/outline: type === 1
+function isVideoLecture(unit) {
+    return unit?.type === 1 || unit?.type === 'lecture';
+}
+
+function isUnitLocked(unit) {
+    return unit?.locked === true;
+}
+
+function detectNewUnitFormat(chapters, urlHint = false) {
+    const firstUnit = getChapterUnits(chapters?.[0] || {})[0];
+    if (firstUnit) return typeof firstUnit.type === 'number';
+    return !!urlHint;
+}
+
+function unitIdOf(unit) {
+    return unit?.id || unit?.unit_id || null;
+}
+
 // Fetch with timeout.
 async function fetchWithTimeout(url, options = {}, timeoutMs = 60_000) {
     const controller = new AbortController();
     const t = setTimeout(() => controller.abort(), timeoutMs);
     try {
-        const res = await fetch(url, { ...options, signal: controller.signal });
+        const res = await fetch(url, {...options, signal: controller.signal});
         return res;
     } finally {
         clearTimeout(t);
     }
 }
 
-async function fetchWithRetry(url, options = {}, { retries = RUNTIME_CONFIG.retryAttempts, timeoutMs = RUNTIME_CONFIG.requestTimeoutMs, onRetry } = {}) {
+async function fetchWithRetry(url, options = {}, {
+    retries = RUNTIME_CONFIG.retryAttempts,
+    timeoutMs = RUNTIME_CONFIG.requestTimeoutMs,
+    onRetry
+} = {}) {
     let lastErr = null;
     for (let attempt = 1; attempt <= retries; attempt++) {
         try {
             const res = await fetchWithTimeout(url, options, timeoutMs);
             if (isRetriableStatus(res.status) && attempt < retries) {
-                if (typeof onRetry === 'function') onRetry({ attempt, retries, reason: `HTTP ${res.status}` });
+                if (typeof onRetry === 'function') onRetry({attempt, retries, reason: `HTTP ${res.status}`});
                 await sleep(toBackoffMs(attempt));
                 continue;
             }
@@ -472,7 +559,7 @@ async function fetchWithRetry(url, options = {}, { retries = RUNTIME_CONFIG.retr
         } catch (err) {
             lastErr = err;
             if (attempt < retries && isRetriableNetworkError(err)) {
-                if (typeof onRetry === 'function') onRetry({ attempt, retries, reason: err.message || String(err) });
+                if (typeof onRetry === 'function') onRetry({attempt, retries, reason: err.message || String(err)});
                 await sleep(toBackoffMs(attempt));
                 continue;
             }
@@ -482,47 +569,192 @@ async function fetchWithRetry(url, options = {}, { retries = RUNTIME_CONFIG.retr
     throw lastErr || new Error('Request failed after retries');
 }
 
-function ensureTrailingSlash(u) { return u.endsWith('/') ? u : u + '/'; }
+function ensureTrailingSlash(u) {
+    return u.endsWith('/') ? u : u + '/';
+}
 
 // Try to detect remote file size and whether server supports Range
 async function getRemoteSizeAndRanges(url, referer) {
     // HEAD first
     try {
-        const res = await fetchWithRetry(url, { method: 'HEAD', headers: { ...commonHeaders(referer), accept: '*/*' } }, { retries: RUNTIME_CONFIG.retryAttempts, timeoutMs: RUNTIME_CONFIG.requestTimeoutMs });
+        const res = await fetchWithRetry(url, {
+            method: 'HEAD',
+            headers: {...commonHeaders(referer), accept: '*/*'}
+        }, {retries: RUNTIME_CONFIG.retryAttempts, timeoutMs: RUNTIME_CONFIG.requestTimeoutMs});
         if (res.ok) {
             const len = res.headers.get('content-length');
             const size = len ? parseInt(len, 10) : undefined;
             const acceptRanges = (res.headers.get('accept-ranges') || '').toLowerCase().includes('bytes');
-            return { size, acceptRanges };
+            return {size, acceptRanges};
         }
-    } catch { }
+    } catch {
+    }
     // Fallback: GET single byte
     try {
-        const res = await fetchWithRetry(url, { method: 'GET', headers: { ...commonHeaders(referer), range: 'bytes=0-0', accept: '*/*' } }, { retries: RUNTIME_CONFIG.retryAttempts, timeoutMs: RUNTIME_CONFIG.requestTimeoutMs });
+        const res = await fetchWithRetry(url, {
+            method: 'GET',
+            headers: {...commonHeaders(referer), range: 'bytes=0-0', accept: '*/*'}
+        }, {retries: RUNTIME_CONFIG.retryAttempts, timeoutMs: RUNTIME_CONFIG.requestTimeoutMs});
         if (res.status === 206) {
             const cr = res.headers.get('content-range');
             // e.g. bytes 0-0/123456
             const m = cr && cr.match(/\/(\d+)$/);
             const size = m ? parseInt(m[1], 10) : undefined;
-            try { if (res.body) { const rb = Readable.fromWeb(res.body); rb.resume(); } } catch { }
-            return { size, acceptRanges: true };
+            try {
+                if (res.body) {
+                    const rb = Readable.fromWeb(res.body);
+                    rb.resume();
+                }
+            } catch {
+            }
+            return {size, acceptRanges: true};
         }
-    } catch { }
-    return { size: undefined, acceptRanges: false };
+    } catch {
+    }
+    return {size: undefined, acceptRanges: false};
 }
 
 // API: fetch chapters JSON for a course.
-async function fetchChapters(courseSlug, referer) {
+// Tries LMS outline API first when numeric course id is known, then falls back to classic chapters API.
+async function fetchChapters(courseSlug, referer, courseId) {
+    if (courseId) {
+        try {
+            const apiUrl = `${ORIGIN}/api/v1/lms/courses/${courseId}/outline/`;
+            const res = await fetchWithRetry(apiUrl, {
+                method: 'GET',
+                headers: {...commonHeaders(referer), accept: 'application/json'}
+            });
+            if (res.ok) {
+                const json = await res.json();
+                if (Array.isArray(json?.chapters)) return json;
+            }
+        } catch {
+            // fall through to classic API
+        }
+    }
     const apiUrl = `${ORIGIN}/api/v1/courses/${courseSlug}/chapters/`;
-    const res = await fetchWithRetry(apiUrl, { method: 'GET', headers: { ...commonHeaders(referer), accept: 'application/json' } });
-    if (!res.ok) throw new Error(explainHttpFailure(res.status, 'Fetch chapters'));
+    const res = await fetchWithRetry(apiUrl, {
+        method: 'GET',
+        headers: {...commonHeaders(referer), accept: 'application/json'}
+    });
+    if (!res.ok) {
+        if (res.status === 404 && !courseId) {
+            throw new Error(buildActionableError(
+                'CHAPTERS_404',
+                'Course chapters not found (HTTP 404). Slug is incomplete or invalid.',
+                [
+                    'Use the full slug ending with -mk<id> (example: my-course-mk12029).',
+                    'Or paste an LMS URL: https://maktabkhooneh.org/lms/course/<slug>-mk<id>/unit/<unit_id>/'
+                ]
+            ));
+        }
+        throw new Error(explainHttpFailure(res.status, 'Fetch chapters'));
+    }
     return res.json();
+}
+
+async function fetchUnitDetails(unitId, referer) {
+    const apiUrl = `${ORIGIN}/api/v1/lms/units/${unitId}/`;
+    const res = await fetchWithRetry(apiUrl, {
+        method: 'GET',
+        headers: {...commonHeaders(referer), accept: 'application/json'}
+    });
+    if (!res.ok) throw new Error(explainHttpFailure(res.status, 'Fetch unit details'));
+    return res.json();
+}
+
+async function fetchUnitVideoUrl(unitId, referer) {
+    const apiUrl = `${ORIGIN}/api/v1/lms/units/${unitId}/video_url/`;
+    const res = await fetchWithRetry(apiUrl, {
+        method: 'GET',
+        headers: {...commonHeaders(referer), accept: 'application/json'}
+    });
+    if (!res.ok) throw new Error(explainHttpFailure(res.status, 'Fetch unit video URL'));
+    return res.json();
+}
+
+function pickBestVideoUrl(videoUrlData) {
+    if (!videoUrlData) return null;
+    const qualities = Array.isArray(videoUrlData.qualities) ? videoUrlData.qualities : [];
+    if (qualities.length > 0) {
+        const sorted = [...qualities].sort((a, b) => (b.resolution || 0) - (a.resolution || 0));
+        const withUrl = sorted.find(q => q.download_url);
+        if (withUrl) return withUrl.download_url;
+    }
+    const v = videoUrlData.video_urls;
+    return v?.hq || v?.lq || null;
+}
+
+async function resolveLmsUnitMedia(unitId, referer) {
+    const [videoUrlData, unitDetails] = await Promise.all([
+        fetchUnitVideoUrl(unitId, referer).catch(() => null),
+        fetchUnitDetails(unitId, referer).catch(() => null)
+    ]);
+    const bestSourceUrl = pickBestVideoUrl(videoUrlData);
+    if (!bestSourceUrl && !unitDetails) return null;
+    const captionFile = unitDetails?.has_caption === true ? (unitDetails?.caption_file || null) : null;
+    const attachmentLinks = Array.isArray(unitDetails?.resources)
+        ? unitDetails.resources.filter(r => r && r.type !== 1 && r.download_url).map(r => r.download_url)
+        : [];
+    return {
+        bestSourceUrl,
+        subtitleLinks: captionFile ? [captionFile] : [],
+        attachmentLinks,
+        captionNeedsFileParam: true
+    };
+}
+
+// Prefer LMS JSON APIs (classic lecture HTML pages are often 404 now). Fall back to HTML scrape.
+async function resolveUnitMedia(unit, {lectureUrl, referer}) {
+    const unitId = unitIdOf(unit);
+    if (unitId) {
+        const lms = await resolveLmsUnitMedia(unitId, referer);
+        if (lms?.bestSourceUrl) return lms;
+    }
+
+    const res = await fetchWithRetry(lectureUrl, {headers: {...commonHeaders(referer), accept: 'text/html'}});
+    if (!res.ok) {
+        if (unitId) {
+            throw new Error(buildActionableError(
+                'UNIT_MEDIA',
+                `Cannot fetch video for unit ${unitId} (LMS blocked and lecture page HTTP ${res.status}).`,
+                [
+                    'Confirm this account has access to the lecture.',
+                    'Use the full course slug ending with -mk<id>.',
+                    `Retry: node download.mjs "${ACTIONABLE_SLUG_PLACEHOLDER}-mk<id>" --force-login --verbose`
+                ]
+            ));
+        }
+        throw new Error(explainHttpFailure(res.status, 'Fetch lecture page'));
+    }
+    const html = await res.text();
+    return {
+        bestSourceUrl: pickBestSource(extractVideoSources(html)),
+        subtitleLinks: extractSubtitleLinks(html),
+        attachmentLinks: extractAttachmentLinks(html),
+        captionNeedsFileParam: false
+    };
+}
+
+// LMS caption URLs often end with "?file=" — frontend fills in the download filename.
+function withCaptionFileParam(captionUrl, subtitleName) {
+    try {
+        const u = new URL(captionUrl, ORIGIN);
+        const fileParam = u.searchParams.get('file');
+        if (fileParam === '' || fileParam == null) u.searchParams.set('file', subtitleName);
+        return u.toString();
+    } catch {
+        return captionUrl;
+    }
 }
 
 // API: core-data to verify authentication and basic profile.
 async function fetchCoreData(referer) {
     const url = `${ORIGIN}/api/v1/general/core-data/?profile=1`;
-    const res = await fetchWithRetry(url, { method: 'GET', headers: { ...commonHeaders(referer || ORIGIN), accept: 'application/json' } });
+    const res = await fetchWithRetry(url, {
+        method: 'GET',
+        headers: {...commonHeaders(referer || ORIGIN), accept: 'application/json'}
+    });
     if (!res.ok) throw new Error(explainHttpFailure(res.status, 'Auth check (core-data)'));
     return res.json();
 }
@@ -542,7 +774,12 @@ function printProfileSummary(core) {
 }
 
 // Build lecture page URL for a specific chapter/unit.
+// Prefer LMS unit URL when unit id exists (classic course/.../unit-slug pages are often 404).
 function buildLectureUrl(courseSlug, chapter, unit) {
+    const unitId = unitIdOf(unit);
+    if (unitId) {
+        return `${ORIGIN}/lms/course/${encodeURIComponent(courseSlug)}/unit/${unitId}/`;
+    }
     const chapterSegment = `${encodeURIComponent(chapter.slug)}-ch${chapter.id}`;
     const unitSegment = encodeURIComponent(unit.slug);
     return `${ORIGIN}/course/${courseSlug}/${chapterSegment}/${unitSegment}/`;
@@ -621,10 +858,14 @@ function extractAttachmentLinks(html) {
 // --- Session / Login helpers ---
 
 async function fetchJson(url, referer) {
-    const res = await fetchWithRetry(url, { headers: { ...commonHeaders(referer), accept: 'application/json' } });
+    const res = await fetchWithRetry(url, {headers: {...commonHeaders(referer), accept: 'application/json'}});
     const text = await res.text();
-    let json = null; try { json = JSON.parse(text); } catch { }
-    return { res, text, json };
+    let json = null;
+    try {
+        json = JSON.parse(text);
+    } catch {
+    }
+    return {res, text, json};
 }
 
 function extractSetCookie(res) {
@@ -633,7 +874,7 @@ function extractSetCookie(res) {
 }
 
 async function obtainCsrfToken() {
-    const { json } = await fetchJson(`${ORIGIN}/api/v1/general/core-data/?profile=1`, ORIGIN);
+    const {json} = await fetchJson(`${ORIGIN}/api/v1/general/core-data/?profile=1`, ORIGIN);
     let csrf = json?.auth?.csrf;
     // Try to parse cookie from ACTIVE_COOKIE fallback
     if (!csrf) {
@@ -642,11 +883,12 @@ async function obtainCsrfToken() {
     return csrf;
 }
 
-import https from 'https';
-
 // Manual minimal cookie store (in-memory) for login flow only
 class SimpleCookieStore {
-    constructor() { this.map = new Map(); }
+    constructor() {
+        this.map = new Map();
+    }
+
     setCookieLine(line) {
         if (!line) return;
         const seg = line.split(';')[0];
@@ -656,12 +898,21 @@ class SimpleCookieStore {
         const v = seg.slice(eq + 1).trim();
         if (k) this.map.set(k, v);
     }
-    applySetCookie(arr) { (arr || []).forEach(l => this.setCookieLine(l)); }
-    get(name) { return this.map.get(name); }
-    headerString() { return Array.from(this.map.entries()).map(([k, v]) => `${k}=${v}`).join('; '); }
+
+    applySetCookie(arr) {
+        (arr || []).forEach(l => this.setCookieLine(l));
+    }
+
+    get(name) {
+        return this.map.get(name);
+    }
+
+    headerString() {
+        return Array.from(this.map.entries()).map(([k, v]) => `${k}=${v}`).join('; ');
+    }
 }
 
-function rawRequest(urlStr, { method = 'GET', headers = {}, body = null } = {}) {
+function rawRequest(urlStr, {method = 'GET', headers = {}, body = null} = {}) {
     const u = new URL(urlStr);
     return new Promise((resolve, reject) => {
         const opts = {
@@ -690,7 +941,8 @@ function rawRequest(urlStr, { method = 'GET', headers = {}, body = null } = {}) 
     });
 }
 
-async function rawRequestWithRetry(urlStr, reqOpts = {}, verbose = () => { }) {
+async function rawRequestWithRetry(urlStr, reqOpts = {}, verbose = () => {
+}) {
     let lastErr = null;
     for (let attempt = 1; attempt <= RUNTIME_CONFIG.retryAttempts; attempt++) {
         try {
@@ -714,7 +966,8 @@ async function rawRequestWithRetry(urlStr, reqOpts = {}, verbose = () => { }) {
     throw lastErr || new Error('Raw request failed after retries');
 }
 
-async function loginWithCredentialsInline(email, password, verbose = () => { }) {
+async function loginWithCredentialsInline(email, password, verbose = () => {
+}) {
     if (!email || !password) {
         throw new Error(buildActionableError(
             'LOGIN_INPUT',
@@ -724,30 +977,39 @@ async function loginWithCredentialsInline(email, password, verbose = () => { }) 
     }
     const store = new SimpleCookieStore();
     const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36';
-    // Helper small debug printer (always go through verbose)
     const dbg = (...a) => verbose('[login]', ...a);
+    const referer = `${ORIGIN}/`;
 
-    // 0. Visit login page to obtain initial csrftoken cookie
-    let r = await rawRequestWithRetry(`${ORIGIN}/accounts/login/`, {
+    // CSRF: prefer core-data (login HTML page is often 404 / flaky). Optionally warm cookies from homepage.
+    let csrf = null;
+    try {
+        const rHome = await rawRequestWithRetry(`${ORIGIN}/`, {
+            method: 'GET',
+            headers: {'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'}
+        }, verbose);
+        store.applySetCookie(rHome.headers['set-cookie']);
+        csrf = store.get('csrftoken') || null;
+    } catch (e) {
+        dbg('Homepage warm-up skipped:', e.message);
+    }
+
+    const rCore = await rawRequestWithRetry(`${ORIGIN}/api/v1/general/core-data/?profile=1`, {
         method: 'GET',
         headers: {
             'User-Agent': UA,
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+            'Accept': 'application/json',
+            ...(store.headerString() ? {Cookie: store.headerString()} : {})
         }
     }, verbose);
-    store.applySetCookie(r.headers['set-cookie']);
-    let csrf = store.get('csrftoken') || null;
-    if (!csrf) {
-        // 0b. fallback: core-data json endpoint (sometimes returns csrf in body)
-        const r2 = await rawRequestWithRetry(`${ORIGIN}/api/v1/general/core-data/?profile=1`, {
-            method: 'GET',
-            headers: { 'User-Agent': UA, 'Accept': 'application/json' }
-        }, verbose);
-        store.applySetCookie(r2.headers['set-cookie']);
-        try { const j2 = JSON.parse(r2.body); csrf = csrf || j2?.auth?.csrf || null; } catch { }
-        if (!csrf) csrf = store.get('csrftoken') || null;
-        dbg('Fallback core-data for CSRF status:', r2.status);
+    store.applySetCookie(rCore.headers['set-cookie']);
+    try {
+        const jCore = JSON.parse(rCore.body);
+        csrf = csrf || jCore?.auth?.csrf || null;
+    } catch {
     }
+    csrf = csrf || store.get('csrftoken') || null;
+    dbg('CSRF bootstrap status:', rCore.status);
+
     if (!csrf) {
         throw new Error(buildActionableError(
             'LOGIN_CSRF',
@@ -770,16 +1032,15 @@ async function loginWithCredentialsInline(email, password, verbose = () => { }) 
         ...h,
         'X-CSRFToken': csrf,
         'Origin': ORIGIN,
-        'Referer': `${ORIGIN}/accounts/login/`
+        'Referer': referer
     });
 
     // 1. check-active-user
     const formCheck = new URLSearchParams();
     formCheck.append('csrfmiddlewaretoken', csrf);
     formCheck.append('tessera', email);
-    // recaptcha sometimes optional; keep param but empty to mimic browser before token set
     formCheck.append('g-recaptcha-response', '');
-    r = await rawRequestWithRetry(`${ORIGIN}/api/v1/auth/check-active-user`, {
+    let r = await rawRequestWithRetry(`${ORIGIN}/api/v1/auth/check-active-user`, {
         method: 'POST',
         headers: addCsrfHeaders({
             ...baseHeaders(),
@@ -792,7 +1053,11 @@ async function loginWithCredentialsInline(email, password, verbose = () => { }) 
     if (r.status < 200 || r.status >= 300) {
         throw new Error(explainHttpFailure(r.status, 'Login step check-active-user'));
     }
-    let jCheck = null; try { jCheck = JSON.parse(r.body); } catch { }
+    let jCheck = null;
+    try {
+        jCheck = JSON.parse(r.body);
+    } catch {
+    }
     if (!jCheck) {
         dbg('check-active-user raw body:', r.body.slice(0, 300));
         throw new Error(buildActionableError(
@@ -803,7 +1068,6 @@ async function loginWithCredentialsInline(email, password, verbose = () => { }) 
     }
     dbg('check-active-user response:', jCheck.status, jCheck.message);
     if (jCheck.status !== 'success') {
-        // Provide clearer error details
         throw new Error(buildActionableError(
             'LOGIN_CHECK_FAILED',
             `check-active-user failed (status=${jCheck.status}, message=${jCheck.message}).`,
@@ -839,7 +1103,11 @@ async function loginWithCredentialsInline(email, password, verbose = () => { }) 
     if (r.status < 200 || r.status >= 300) {
         throw new Error(explainHttpFailure(r.status, 'Login step login-authentication'));
     }
-    let jLogin = null; try { jLogin = JSON.parse(r.body); } catch { }
+    let jLogin = null;
+    try {
+        jLogin = JSON.parse(r.body);
+    } catch {
+    }
     if (!jLogin) {
         dbg('login-authentication raw body:', r.body.slice(0, 300));
         throw new Error(buildActionableError(
@@ -858,7 +1126,6 @@ async function loginWithCredentialsInline(email, password, verbose = () => { }) 
     }
     dbg('login-authentication OK');
 
-    // Compose final cookie header (only what we need for reuse)
     const sessionid = store.get('sessionid');
     const csrftoken = store.get('csrftoken') || csrf;
     if (!sessionid) {
@@ -873,7 +1140,7 @@ async function loginWithCredentialsInline(email, password, verbose = () => { }) 
     return true;
 }
 
-async function prepareSession({ userEmail, userPassword, verbose, courseUrl, forceLogin, config, configPath }) {
+async function prepareSession({userEmail, userPassword, verbose, courseUrl, forceLogin, config, configPath}) {
     // Helper to verify current ACTIVE_COOKIE by calling core-data
     const verify = async () => {
         try {
@@ -885,8 +1152,8 @@ async function prepareSession({ userEmail, userPassword, verbose, courseUrl, for
                 logInfo('Session valid' + (userEmail ? ` (user: ${userEmail})` : ''));
                 return core;
             }
-                logWarn('Stored session is expired/invalid (not authenticated).');
-                return null;
+            logWarn('Stored session is expired/invalid (not authenticated).');
+            return null;
         } catch (e) {
             verbose('Verify failed: ' + e.message);
             return null;
@@ -901,7 +1168,7 @@ async function prepareSession({ userEmail, userPassword, verbose, courseUrl, for
         ACTIVE_COOKIE = COOKIE;
         verbose('Using cookie from config override');
         const core = await verify();
-        if (core) return { core, source: 'config-cookie' };
+        if (core) return {core, source: 'config-cookie'};
         if (!forceLogin) {
             logWarn('Cookie from config.auth.cookie/cookieFile is invalid; trying stored session/login fallback.');
         }
@@ -912,7 +1179,7 @@ async function prepareSession({ userEmail, userPassword, verbose, courseUrl, for
         ACTIVE_COOKIE = storedSessionCookie;
         logStep('Loaded stored session from config.auth.sessionCookie');
         const core = await verify();
-        if (core) return { core, source: 'config-session' };
+        if (core) return {core, source: 'config-session'};
         logWarn('Stored config session is invalid; will attempt fresh login.');
         ACTIVE_COOKIE = null;
     }
@@ -929,7 +1196,7 @@ async function prepareSession({ userEmail, userPassword, verbose, courseUrl, for
                 logSuccess('Login success; session saved to config.auth.sessionCookie');
             }
             const core = await verify();
-            if (core) return { core, source: 'fresh-login' };
+            if (core) return {core, source: 'fresh-login'};
         } catch (e) {
             logWarn('Inline login failed: ' + e.message);
         }
@@ -946,7 +1213,7 @@ async function prepareSession({ userEmail, userPassword, verbose, courseUrl, for
             ]
         ));
     }
-    return { core: null, source: 'none' };
+    return {core: null, source: 'none'};
 }
 
 // Extract <track ... src="..."> subtitle URLs from lecture HTML.
@@ -963,37 +1230,24 @@ function extractSubtitleLinks(html) {
     return Array.from(results);
 }
 
-// Transform stream to limit to first N bytes and optionally signal upstream.
-class ByteLimit extends Transform {
-    // Limits the stream to the first `limit` bytes, then signals upstream to stop.
-    constructor(limit, onLimit) { super(); this.limit = limit; this.seen = 0; this._hit = false; this._onLimit = onLimit; }
-    _transform(chunk, enc, cb) {
-        if (this.limit <= 0) { this.push(chunk); return cb(); }
-        const remaining = this.limit - this.seen;
-        if (remaining <= 0) { return cb(); }
-        const buf = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
-        this.push(buf);
-        this.seen += buf.length;
-        if (!this._hit && this.seen >= this.limit) {
-            this.end();
-            this._hit = true;
-            if (typeof this._onLimit === 'function') {
-                try { this._onLimit(); } catch { }
-            }
-        }
-        cb();
-    }
-}
-
-// Download a URL to a file (with retries). If sampleBytes > 0, request a Range and also enforce a local limit.
+// Download a URL to a file (with retries). If sampleBytes > 0, request a Range and buffer the small payload.
 // label: optional display name to show in the progress line (e.g., final file name)
 async function downloadToFile(url, filePath, referer, maxRetries = RUNTIME_CONFIG.retryAttempts, sampleBytes = 0, label = '') {
     // Skip if already exists with non-zero size
     let existingFinalSize = 0;
-    try { const stat = fs.statSync(filePath); existingFinalSize = stat.size; if (existingFinalSize > 0 && sampleBytes > 0) return 'exists'; } catch { }
+    try {
+        const stat = fs.statSync(filePath);
+        existingFinalSize = stat.size;
+        if (existingFinalSize > 0 && sampleBytes > 0) return 'exists';
+    } catch {
+    }
     const tmpPath = filePath + '.part';
     let existingTmpSize = 0;
-    try { const stat = fs.statSync(tmpPath); existingTmpSize = stat.size; } catch { }
+    try {
+        const stat = fs.statSync(tmpPath);
+        existingTmpSize = stat.size;
+    } catch {
+    }
 
     // For full downloads, see if final is already complete
     let remoteInfo;
@@ -1019,7 +1273,13 @@ async function downloadToFile(url, filePath, referer, maxRetries = RUNTIME_CONFI
                     if (!remoteInfo) remoteInfo = await getRemoteSizeAndRanges(url, referer);
                     if (remoteInfo.acceptRanges) {
                         // Move final to tmp to resume appending
-                        try { await fs.promises.rename(filePath, tmpPath); existingTmpSize = existingFinalSize; resumeOffset = existingFinalSize; existingFinalSize = 0; } catch { }
+                        try {
+                            await fs.promises.rename(filePath, tmpPath);
+                            existingTmpSize = existingFinalSize;
+                            resumeOffset = existingFinalSize;
+                            existingFinalSize = 0;
+                        } catch {
+                        }
                     } else {
                         // Cannot resume; start from scratch
                         resumeOffset = 0;
@@ -1027,7 +1287,10 @@ async function downloadToFile(url, filePath, referer, maxRetries = RUNTIME_CONFI
                 }
             }
 
-            const requestInit = { method: 'GET', headers: { ...commonHeaders(referer), accept: 'video/mp4,application/octet-stream,*/*' } };
+            const requestInit = {
+                method: 'GET',
+                headers: {...commonHeaders(referer), accept: 'video/mp4,application/octet-stream,*/*'}
+            };
             if (sampleBytes && sampleBytes > 0) {
                 requestInit.headers['range'] = `bytes=0-${Math.max(0, sampleBytes - 1)}`;
             } else if (resumeOffset > 0) {
@@ -1036,24 +1299,43 @@ async function downloadToFile(url, filePath, referer, maxRetries = RUNTIME_CONFI
 
             const controller = new AbortController();
             const to = setTimeout(() => controller.abort(), RUNTIME_CONFIG.requestTimeoutMs);
-            const res = await fetch(url, { ...requestInit, signal: controller.signal });
+            const res = await fetch(url, {...requestInit, signal: controller.signal});
             if (!res.ok || !res.body) throw new Error(explainHttpFailure(res.status, 'Download'));
             if (resumeOffset > 0 && res.status !== 206) {
                 // Server didn't honor Range; restart from 0
-                try { await fs.promises.unlink(tmpPath); } catch { }
-                existingTmpSize = 0; resumeOffset = 0;
+                try {
+                    await fs.promises.unlink(tmpPath);
+                } catch {
+                }
+                existingTmpSize = 0;
+                resumeOffset = 0;
                 clearTimeout(to);
                 throw new Error('Server did not honor range; restarting from 0');
             }
 
-            await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
-            const write = fs.createWriteStream(writingTo, { flags: (sampleBytes > 0 || resumeOffset === 0) ? 'w' : 'a' });
+            await fs.promises.mkdir(path.dirname(filePath), {recursive: true});
+
+            // Sample mode: Range already requested. Buffer the small payload to avoid
+            // stream abort races that truncate the on-disk file.
+            if (sampleBytes && sampleBytes > 0) {
+                const raw = Buffer.from(await res.arrayBuffer());
+                clearTimeout(to);
+                const out = raw.subarray(0, Math.min(raw.length, sampleBytes));
+                await fs.promises.writeFile(filePath, out);
+                process.stdout.write(`  ⬇️  [${buildProgressBar(1)}] 100.0%  ${formatBytes(out.length)} / ${formatBytes(sampleBytes)}\n`);
+                return 'downloaded';
+            }
+
+            const write = fs.createWriteStream(writingTo, {flags: resumeOffset === 0 ? 'w' : 'a'});
             const readable = Readable.fromWeb(res.body);
             let readIdleTimer = null;
             const resetReadTimeout = () => {
                 if (readIdleTimer) clearTimeout(readIdleTimer);
                 readIdleTimer = setTimeout(() => {
-                    try { controller.abort(); } catch { }
+                    try {
+                        controller.abort();
+                    } catch {
+                    }
                 }, RUNTIME_CONFIG.readTimeoutMs);
             };
             resetReadTimeout();
@@ -1065,8 +1347,7 @@ async function downloadToFile(url, filePath, referer, maxRetries = RUNTIME_CONFI
             let expectedTotal;
             const contentRange = res.headers.get('content-range');
             const crMatch = contentRange && contentRange.match(/\/(\d+)$/);
-            if (sampleBytes && sampleBytes > 0) expectedTotal = sampleBytes;
-            else if (crMatch) expectedTotal = parseInt(crMatch[1], 10);
+            if (crMatch) expectedTotal = parseInt(crMatch[1], 10);
             else if (fullLength && resumeOffset > 0) expectedTotal = resumeOffset + fullLength;
             else expectedTotal = fullLength;
             let downloadedBytes = resumeOffset;
@@ -1115,30 +1396,9 @@ async function downloadToFile(url, filePath, referer, maxRetries = RUNTIME_CONFI
                     cb(null, chunk);
                 }
             });
-            let byteLimitReached = false;
             try {
-                if (sampleBytes && sampleBytes > 0) {
-                    const limiter = new ByteLimit(sampleBytes, () => {
-                        byteLimitReached = true;
-                        try { readable.destroy(new Error('byte-limit')); } catch { }
-                        try { controller.abort(); } catch { }
-                    });
-                    await pipeline(readable, counter, limiter, write);
-                } else {
-                    await pipeline(readable, counter, write);
-                }
+                await pipeline(readable, counter, write);
             } catch (pipeErr) {
-                if (sampleBytes && byteLimitReached) {
-                    try { clearTimeout(to); } catch { }
-                    try { render(true); process.stdout.write('\n'); } catch { }
-                    try {
-                        await fs.promises.rename(tmpPath, filePath);
-                    } catch (e) {
-                        try { await fs.promises.copyFile(writingTo, filePath); } catch { }
-                    }
-                    try { await fs.promises.unlink(tmpPath); } catch { }
-                    return 'downloaded';
-                }
                 throw pipeErr;
             } finally {
                 clearTimeout(to);
@@ -1146,18 +1406,30 @@ async function downloadToFile(url, filePath, referer, maxRetries = RUNTIME_CONFI
             }
 
             // finalize progress bar to 100%
-            try { render(true); } catch { }
+            try {
+                render(true);
+            } catch {
+            }
             process.stdout.write('\n');
             try {
                 await fs.promises.rename(tmpPath, filePath);
             } catch (e) {
-                try { await fs.promises.copyFile(writingTo, filePath); } catch { }
+                try {
+                    await fs.promises.copyFile(writingTo, filePath);
+                } catch {
+                }
             }
-            try { await fs.promises.unlink(tmpPath); } catch { }
+            try {
+                await fs.promises.unlink(tmpPath);
+            } catch {
+            }
             return 'downloaded';
-            } catch (err) {
-                try { process.stdout.write('\n'); } catch { }
-                // Keep .part file for future resume; do not delete on error
+        } catch (err) {
+            try {
+                process.stdout.write('\n');
+            } catch {
+            }
+            // Keep .part file for future resume; do not delete on error
             const retryable = isRetriableNetworkError(err) || /HTTP (408|425|429|5\d\d)/.test(String(err?.message || ''));
             if (attempt < maxRetries && retryable) {
                 logWarn(`Retry ${attempt}/${maxRetries} for ${path.basename(filePath)} after error: ${err.message}`);
@@ -1170,13 +1442,25 @@ async function downloadToFile(url, filePath, referer, maxRetries = RUNTIME_CONFI
 }
 
 function toAbsoluteUrl(url, base = ORIGIN) {
-    try { return new URL(url, base).toString(); } catch { return url; }
+    try {
+        return new URL(url, base).toString();
+    } catch {
+        return url;
+    }
 }
 
 async function main() {
     const argv = process.argv.slice(2);
-    const configArgPath = discoverConfigPath(argv);
-    const { config, configPath } = loadConfigFile(configArgPath);
+    const {path: configArgPath, explicit: configPathExplicit} = discoverConfigPath(argv);
+    const {config, configPath, exists: configExists} = loadConfigFile(configArgPath);
+    if (configPathExplicit && !configExists) {
+        logError(buildActionableError(
+            'CONFIG_MISSING',
+            `Config file not found: ${configPath}`,
+            'Create the file, or omit --config to use ./config.json.'
+        ));
+        process.exit(1);
+    }
     const runtimeCfg = (config.runtime && typeof config.runtime === 'object') ? config.runtime : {};
     const defaultsCfg = (config.defaults && typeof config.defaults === 'object') ? config.defaults : {};
     const authCfg = (config.auth && typeof config.auth === 'object') ? config.auth : {};
@@ -1190,14 +1474,24 @@ async function main() {
         forceLogin: defaultsCfg.forceLogin ?? false
     };
     const {
-        inputCourseRef, sampleBytesToDownload, isVerboseLoggingEnabled, isDryRun, forceLogin, selectedChapters, selectedLessons
+        inputCourseRef,
+        sampleBytesToDownload,
+        isVerboseLoggingEnabled,
+        isDryRun,
+        forceLogin,
+        selectedChapters,
+        selectedLessons
     } = parseCLI(parserDefaults, configPath);
     LOGIN_EMAIL = String(authCfg.email || '').trim();
     LOGIN_PASSWORD = String(authCfg.password || '').trim();
     if (authCfg.cookie && String(authCfg.cookie).trim()) {
         COOKIE = String(authCfg.cookie).trim();
     } else if (authCfg.cookieFile) {
-        try { COOKIE = fs.readFileSync(String(authCfg.cookieFile), 'utf8').trim() || 'PUT_YOUR_COOKIE_HERE'; } catch { COOKIE = 'PUT_YOUR_COOKIE_HERE'; }
+        try {
+            COOKIE = fs.readFileSync(String(authCfg.cookieFile), 'utf8').trim() || 'PUT_YOUR_COOKIE_HERE';
+        } catch {
+            COOKIE = 'PUT_YOUR_COOKIE_HERE';
+        }
     } else {
         COOKIE = 'PUT_YOUR_COOKIE_HERE';
     }
@@ -1208,8 +1502,11 @@ async function main() {
     };
     const userEmail = LOGIN_EMAIL || null;
     const userPassword = LOGIN_PASSWORD || null;
-    const { verbose } = createVerboseLogger(isVerboseLoggingEnabled);
-    if (!inputCourseRef) { printUsage(); process.exit(1); }
+    const {verbose} = createVerboseLogger(isVerboseLoggingEnabled);
+    if (!inputCourseRef) {
+        printUsage();
+        process.exit(1);
+    }
     const baseUrl = normalizeBaseUrl(courseCfg.baseUrl || `${ORIGIN}/course/`);
     const resolvedCourseUrl = isLikelyFullUrl(inputCourseRef)
         ? String(inputCourseRef).trim()
@@ -1228,10 +1525,20 @@ async function main() {
     verbose(`Config file: ${configPath}${fs.existsSync(configPath) ? '' : ' (not found, using defaults)'}`);
     verbose(`Resolved course URL: ${resolvedCourseUrl}`);
     verbose(`Runtime config => retries=${RUNTIME_CONFIG.retryAttempts}, request-timeout=${RUNTIME_CONFIG.requestTimeoutMs}ms, read-timeout=${RUNTIME_CONFIG.readTimeoutMs}ms`);
-    const normalizedCourseUrl = ensureTrailingSlash(resolvedCourseUrl.trim());
+    const normalizedCourseUrl = toHeaderSafeUrl(ensureTrailingSlash(resolvedCourseUrl.trim()));
     const courseSlug = extractCourseSlug(normalizedCourseUrl);
+    const courseId = extractCourseIdFromSlug(courseSlug);
+    const urlIsLmsFormat = /\/lms\/course\//.test(normalizedCourseUrl);
     // Attempt to load / create / verify session (may already return core)
-    const prep = await prepareSession({ userEmail, userPassword, verbose, courseUrl: normalizedCourseUrl, forceLogin, config, configPath });
+    const prep = await prepareSession({
+        userEmail,
+        userPassword,
+        verbose,
+        courseUrl: normalizedCourseUrl,
+        forceLogin,
+        config,
+        configPath
+    });
     ensureCookiePresent();
 
     // Build a cleaner course folder name: remove trailing mk id and replace dashes with spaces.
@@ -1239,7 +1546,10 @@ async function main() {
     const outputRootFolder = path.resolve(process.cwd(), 'download', courseDisplayName);
     // Ensure base output folder exists only for real downloads
     if (!isDryRun) {
-        try { await fs.promises.mkdir(outputRootFolder, { recursive: true }); } catch { }
+        try {
+            await fs.promises.mkdir(outputRootFolder, {recursive: true});
+        } catch {
+        }
     }
 
     // Verify auth profile (reuse from prepareSession if available)
@@ -1289,7 +1599,8 @@ async function main() {
 
     // Fetch chapters
     verbose(paintCyan('Fetching chapters...'));
-    const chaptersData = await fetchChapters(courseSlug, normalizedCourseUrl);
+    if (courseId) verbose(`Course id from slug: ${courseId}`);
+    const chaptersData = await fetchChapters(courseSlug, normalizedCourseUrl, courseId);
     const chapters = Array.isArray(chaptersData?.chapters) ? chaptersData.chapters : [];
     if (chapters.length === 0) {
         logError(buildActionableError(
@@ -1303,6 +1614,9 @@ async function main() {
         ));
         process.exit(2);
     }
+    const useNewFormat = detectNewUnitFormat(chapters, urlIsLmsFormat);
+    if (useNewFormat) verbose('Using LMS outline unit format');
+    else verbose('Using classic chapters format (LMS media APIs still preferred per unit)');
 
     if (isDryRun) {
         let totalLectures = 0;
@@ -1319,7 +1633,7 @@ async function main() {
             const chapterNo = chapterIndex + 1;
             if (selectedChapters && !selectedChapters.has(chapterNo)) continue;
             const chapterFolder = path.join(outputRootFolder, `فصل ${chapterNo} - ${sanitizeName(chapter.title || chapter.slug || 'chapter')}`);
-            const units = Array.isArray(chapter.unit_set) ? chapter.unit_set : [];
+            const units = getChapterUnits(chapter);
             let chapterLectureNo = 0;
             let chapterKnownBytes = 0;
             let chapterUnknownSize = 0;
@@ -1331,7 +1645,7 @@ async function main() {
             console.log(`📂 Output: ${paintCyan(chapterFolder)}`);
             for (let unitIndex = 0; unitIndex < units.length; unitIndex++) {
                 const unit = units[unitIndex];
-                if (!unit?.status || unit?.type !== 'lecture') continue;
+                if (!isUnitActive(unit) || !isVideoLecture(unit)) continue;
                 chapterLectureNo++;
                 if (selectedLessons && !selectedLessons.has(chapterLectureNo)) continue;
                 chapterSelected++;
@@ -1341,7 +1655,7 @@ async function main() {
                 const finalFileName = (sampleBytesToDownload && sampleBytesToDownload > 0)
                     ? baseFileName.replace(/\.mp4$/i, '.sample.mp4')
                     : baseFileName;
-                if (unit.locked) {
+                if (isUnitLocked(unit)) {
                     chapterLocked++;
                     totalLocked++;
                     console.log(`  🔒 ${finalFileName}  | locked / no access`);
@@ -1349,11 +1663,8 @@ async function main() {
                 }
                 const lectureUrl = buildLectureUrl(courseSlug, chapter, unit);
                 try {
-                    const res = await fetchWithRetry(lectureUrl, { headers: { ...commonHeaders(normalizedCourseUrl), accept: 'text/html' } });
-                    if (!res.ok) throw new Error(explainHttpFailure(res.status, 'Fetch lecture page'));
-                    const html = await res.text();
-                    const videoSources = extractVideoSources(html);
-                    const bestSourceUrl = pickBestSource(videoSources);
+                    const media = await resolveUnitMedia(unit, {lectureUrl, referer: normalizedCourseUrl});
+                    const bestSourceUrl = media.bestSourceUrl;
                     if (!bestSourceUrl) {
                         console.log(`  ⚠️ ${finalFileName}  | no video source found`);
                         chapterUnknownSize++;
@@ -1362,8 +1673,8 @@ async function main() {
                     }
                     const videoInfo = await getRemoteSizeAndRanges(bestSourceUrl, lectureUrl);
                     const videoBytes = Number.isFinite(videoInfo?.size) ? videoInfo.size : null;
-                    const subtitleLinks = extractSubtitleLinks(html).map(s => toAbsoluteUrl(s, ORIGIN));
-                    const attachmentLinks = extractAttachmentLinks(html).map(a => toAbsoluteUrl(a, ORIGIN));
+                    const subtitleLinks = media.subtitleLinks.map(s => toAbsoluteUrl(s, ORIGIN));
+                    const attachmentLinks = media.attachmentLinks.map(a => toAbsoluteUrl(a, ORIGIN));
                     let subtitleKnownBytes = 0;
                     let subtitleUnknown = 0;
                     let attachmentKnownBytes = 0;
@@ -1425,6 +1736,17 @@ async function main() {
         console.log(`💾 Estimated total (known sizes): ${paintGreen(formatBytes(totalKnownBytes))}`);
         console.log(`❓ Unknown-size items: ${paintYellow(String(totalUnknownSize))}`);
         console.log(`ℹ️ Note: This is an estimate based on server-reported sizes (HEAD/Range). Final size may differ.`);
+        if (totalLectures === 0 && (selectedChapters || selectedLessons)) {
+            logError(buildActionableError(
+                'FILTER_EMPTY',
+                'No lectures matched the given --chapter/--lesson filters.',
+                [
+                    'Check chapter/lesson numbers (lesson numbers count only video lectures per chapter).',
+                    'Omit filters to preview the whole course, or widen the range.'
+                ]
+            ));
+            process.exit(2);
+        }
         return;
     }
 
@@ -1438,12 +1760,15 @@ async function main() {
             const chapterFolder = path.join(outputRootFolder, `فصل ${chapterNo} - ${sanitizeName(chapter.title || chapter.slug || 'chapter')}`);
             console.log(`📖 Chapter ${chapterIndex + 1}/${chapters.length}: ${paintBold(chapter.title || chapter.slug)}`);
 
-            const units = Array.isArray(chapter.unit_set) ? chapter.unit_set : [];
+            const units = getChapterUnits(chapter);
             let chapterLectureNo = 0;
             for (let unitIndex = 0; unitIndex < units.length; unitIndex++) {
                 const unit = units[unitIndex];
-                if (!unit?.status) continue; // inactive
-                if (unit?.type !== 'lecture') { nonLectureUnits++; continue; } // skip non-video units
+                if (!isUnitActive(unit)) continue;
+                if (!isVideoLecture(unit)) {
+                    nonLectureUnits++;
+                    continue;
+                }
                 chapterLectureNo++;
                 if (selectedLessons && !selectedLessons.has(chapterLectureNo)) continue;
                 totalUnits++;
@@ -1455,8 +1780,7 @@ async function main() {
                 const outputFilePath = path.join(chapterFolder, finalFileName);
                 verbose(`  🎬 Unit ${unitIndex + 1}/${units.length}: ${unit.title || unit.slug}`);
 
-                // Skip locked content or content requiring purchase
-                if (unit.locked) {
+                if (isUnitLocked(unit)) {
                     logWarn(`🔒 Locked/No access: ${finalFileName}`);
                     skippedCount++;
                     continue;
@@ -1464,32 +1788,44 @@ async function main() {
 
                 const lectureUrl = buildLectureUrl(courseSlug, chapter, unit);
                 try {
-                    // Fetch lecture page HTML
-                    const res = await fetchWithRetry(lectureUrl, { headers: { ...commonHeaders(normalizedCourseUrl), accept: 'text/html' } });
-                    if (!res.ok) throw new Error(explainHttpFailure(res.status, 'Fetch lecture page'));
-                    const html = await res.text();
-                    const videoSources = extractVideoSources(html);
-                    const bestSourceUrl = pickBestSource(videoSources);
-                    if (!bestSourceUrl) { logWarn(`No video source found for: ${finalFileName}`); skippedCount++; continue; }
-
+                    const media = await resolveUnitMedia(unit, {lectureUrl, referer: normalizedCourseUrl});
+                    const bestSourceUrl = media.bestSourceUrl;
+                    if (!bestSourceUrl) {
+                        logWarn(`No video source found for: ${finalFileName}`);
+                        skippedCount++;
+                        continue;
+                    }
 
                     // Print the filename on its own line; progress bar will render on the next line
                     console.log(`📥 Downloading: ${finalFileName}`);
                     const status = await downloadToFile(bestSourceUrl, outputFilePath, lectureUrl, RUNTIME_CONFIG.retryAttempts, sampleBytesToDownload, '');
-                    if (status === 'exists') { console.log(paintYellow(`🟡 SKIP exists: ${finalFileName}`)); skippedCount++; }
-                    else { logSuccess(`DOWNLOADED: ${finalFileName}`); downloadedCount++; }
+                    if (status === 'exists') {
+                        console.log(paintYellow(`🟡 SKIP exists: ${finalFileName}`));
+                        skippedCount++;
+                    } else {
+                        logSuccess(`DOWNLOADED: ${finalFileName}`);
+                        downloadedCount++;
+                    }
 
                     // ---- Subtitles (download beside video, same base name) ----
                     try {
-                        const subtitleLinks = extractSubtitleLinks(html);
-                        if (subtitleLinks.length > 0) {
+                        if (media.subtitleLinks.length > 0) {
                             const videoBaseNoExt = finalFileName.replace(/\.sample\.mp4$/i, '').replace(/\.mp4$/i, '');
-                            for (const sUrl of subtitleLinks) {
+                            for (const sUrl of media.subtitleLinks) {
                                 try {
-                                    const absUrl = (() => { try { return new URL(sUrl, ORIGIN).toString(); } catch { return sUrl; } })();
-                                    // determine extension from pathname or fallback to .vtt
                                     let ext = '.vtt';
-                                    try { const up = new URL(absUrl); ext = path.extname(up.pathname) || '.vtt'; } catch { }
+                                    let absUrl = sUrl;
+                                    if (media.captionNeedsFileParam) {
+                                        const subtitleName = `${videoBaseNoExt}.vtt`;
+                                        absUrl = withCaptionFileParam(sUrl, subtitleName);
+                                    } else {
+                                        absUrl = toAbsoluteUrl(sUrl, ORIGIN);
+                                        try {
+                                            const up = new URL(absUrl);
+                                            ext = path.extname(up.pathname) || '.vtt';
+                                        } catch {
+                                        }
+                                    }
                                     const subtitleName = `${videoBaseNoExt}${ext}`;
                                     const subtitlePath = path.join(chapterFolder, subtitleName);
                                     if (fs.existsSync(subtitlePath) && fs.statSync(subtitlePath).size > 0) {
@@ -1501,26 +1837,28 @@ async function main() {
                                     if (sStatus === 'exists') console.log(paintYellow(`🟡 Subtitle exists: ${subtitleName}`));
                                     else logSuccess(`SUBTITLE: ${subtitleName}`);
                                     await sleep(150);
-                                } catch (subErr) { logWarn(`Subtitle fail: ${subErr.message}`); }
+                                } catch (subErr) {
+                                    logWarn(`Subtitle fail: ${subErr.message}`);
+                                }
                             }
                         }
-                    } catch (subOuter) { logWarn(`Subtitle parse error: ${subOuter.message}`); }
+                    } catch (subOuter) {
+                        logWarn(`Subtitle parse error: ${subOuter.message}`);
+                    }
 
                     // ---- Attachments (download beside video) ----
                     try {
-                        const attachmentLinks = extractAttachmentLinks(html);
-                        if (attachmentLinks.length > 0) {
-                            // Derive base (remove .sample.mp4 or .mp4)
+                        if (media.attachmentLinks.length > 0) {
                             const videoBaseNoExt = finalFileName.replace(/\.sample\.mp4$/i, '').replace(/\.mp4$/i, '');
-                            for (const attUrl of attachmentLinks) {
+                            for (const attUrl of media.attachmentLinks) {
                                 try {
-                                    // Extract original filename from URL path (strip query)
                                     let filePart;
                                     try {
                                         const u = new URL(attUrl);
                                         filePart = u.pathname.split('/').pop() || 'attachment.bin';
-                                    } catch { filePart = attUrl.split('?')[0].split('/').pop() || 'attachment.bin'; }
-                                    // Keep original name (with underscores) but sanitize forbidden characters
+                                    } catch {
+                                        filePart = attUrl.split('?')[0].split('/').pop() || 'attachment.bin';
+                                    }
                                     const sanitizedAttachment = sanitizeName(filePart);
                                     const finalAttachmentName = `${videoBaseNoExt} - ${sanitizedAttachment}`;
                                     const attachmentPath = path.join(chapterFolder, finalAttachmentName);
@@ -1555,8 +1893,19 @@ async function main() {
         console.log(`✅ Downloaded: ${paintGreen(String(downloadedCount))}`);
         console.log(`🟡 Skipped: ${paintYellow(String(skippedCount))}`);
         console.log(`❌ Failed: ${paintRed(String(failedCount))}`);
+        if (failedCount > 0) process.exitCode = 1;
         if (totalUnits === 0) {
-            if (nonLectureUnits > 0) {
+            if (selectedChapters || selectedLessons) {
+                logError(buildActionableError(
+                    'FILTER_EMPTY',
+                    'No lectures matched the given --chapter/--lesson filters.',
+                    [
+                        'Check chapter/lesson numbers (lesson numbers count only video lectures per chapter).',
+                        'Omit filters to download the whole course, or widen the range.'
+                    ]
+                ));
+                process.exitCode = 2;
+            } else if (nonLectureUnits > 0) {
                 logInfo(`No downloadable video lectures found. This course appears to contain only non-video units (e.g. assignment/quiz).`);
             } else {
                 logInfo('No downloadable video lectures found for this course with current access/session.');

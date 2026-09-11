@@ -22,3 +22,11 @@ docs/
 backup/
 New Text Document.txt
 signup/
+
+# Local secrets / test configs
+*.local.json
+.test-config.local.json
+
+# macOS AppleDouble / IDE
+._*
+.idea/
