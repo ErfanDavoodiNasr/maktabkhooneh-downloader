@@ -614,6 +614,36 @@ async function getRemoteSizeAndRanges(url, referer) {
     return {size: undefined, acceptRanges: false};
 }
 
+function cookieValue(name) {
+    const ck = ACTIVE_COOKIE || COOKIE || '';
+    const m = String(ck).match(new RegExp(`(?:^|;\\s*)${name}=([^;]*)`));
+    return m ? decodeURIComponent(m[1]) : null;
+}
+
+// LMS video APIs return 403 until the account is enrolled on the course (idempotent).
+async function ensureCourseEnrollment(courseSlug, referer) {
+    const headers = {
+        ...commonHeaders(referer),
+        accept: 'application/json',
+        'content-type': 'application/json'
+    };
+    const csrf = cookieValue('csrftoken');
+    if (csrf) headers['X-CSRFToken'] = csrf;
+    const apiUrl = `${ORIGIN}/api/v1/courses/${courseSlug}/enroll/`;
+    const res = await fetchWithRetry(apiUrl, {method: 'POST', headers, body: '{}'});
+    if (!res.ok) {
+        throw new Error(buildActionableError(
+            'ENROLL',
+            `Cannot enroll in course (HTTP ${res.status}). LMS video APIs need enrollment.`,
+            [
+                'Confirm this account purchased/has access to the course.',
+                `Retry: node download.mjs "${ACTIONABLE_SLUG_PLACEHOLDER}-mk<id>" --force-login`
+            ]
+        ));
+    }
+    return res.json().catch(() => ({}));
+}
+
 // API: fetch chapters JSON for a course.
 // Tries LMS outline API first when numeric course id is known, then falls back to classic chapters API.
 async function fetchChapters(courseSlug, referer, courseId) {
@@ -1595,6 +1625,18 @@ async function main() {
     }
     if (isDryRun) {
         console.log(`🧪 Mode: ${paintYellow('DRY RUN')} (no files will be downloaded)`);
+    }
+
+    // Activate LMS access (required before video_url / outline work)
+    verbose(paintCyan('Ensuring course enrollment...'));
+    try {
+        const enrolled = await ensureCourseEnrollment(courseSlug, normalizedCourseUrl);
+        const access = enrolled?.access_level_text || enrolled?.access_level;
+        if (access) console.log(`🎫 Course access: ${paintGreen(access)}`);
+        else verbose('Enrollment OK');
+    } catch (e) {
+        logWarn(String(e.message || e));
+        verbose('Continuing without fresh enrollment (may already be enrolled)');
     }
 
     // Fetch chapters
