@@ -59,7 +59,7 @@ describe('config extras', () => {
 
 describe('http-util extras', () => {
     it('backoff and retry-after caps', () => {
-        assert.ok(toBackoffMs(1) < toBackoffMs(5));
+        assert.ok(toBackoffMs(1, {jitter: 0}) < toBackoffMs(5, {jitter: 0}));
         assert.equal(parseRetryAfterMs('999999'), 120_000);
         assert.equal(parseRetryAfterMs('2'), 2000);
         assert.equal(isRetriableStatus(503), true);

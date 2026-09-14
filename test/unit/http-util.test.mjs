@@ -29,9 +29,18 @@ describe('retry classification', () => {
 
 describe('backoff / Retry-After', () => {
     it('exponential backoff capped', () => {
-        assert.equal(toBackoffMs(1, {base: 100, cap: 1000}), 100);
-        assert.equal(toBackoffMs(2, {base: 100, cap: 1000}), 200);
-        assert.equal(toBackoffMs(10, {base: 100, cap: 1000}), 1000);
+        assert.equal(toBackoffMs(1, {base: 100, cap: 1000, jitter: 0}), 100);
+        assert.equal(toBackoffMs(2, {base: 100, cap: 1000, jitter: 0}), 200);
+        assert.equal(toBackoffMs(10, {base: 100, cap: 1000, jitter: 0}), 1000);
+    });
+
+    it('applies bounded jitter when enabled', () => {
+        const ms = toBackoffMs(3, {base: 100, cap: 10_000, jitter: 0.2, random: () => 0.5});
+        assert.equal(ms, 400);
+        const low = toBackoffMs(3, {base: 100, cap: 10_000, jitter: 0.2, random: () => 0});
+        const high = toBackoffMs(3, {base: 100, cap: 10_000, jitter: 0.2, random: () => 1});
+        assert.ok(low < high);
+        assert.ok(low >= 320 && high <= 480);
     });
 
     it('parses Retry-After seconds and HTTP-date, capped', () => {

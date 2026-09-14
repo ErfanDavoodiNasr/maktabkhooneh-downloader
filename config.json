@@ -3,12 +3,12 @@
     "baseUrl": "https://maktabkhooneh.org/course/"
   },
   "auth": {
-    "email": "",
-    "password": "",
+    "email": "09114905929",
+    "password": "ErfanMaktabkhooneh@7812",
     "cookie": "",
     "cookieFile": "",
-    "sessionCookie": "",
-    "sessionUpdated": ""
+    "sessionCookie": "csrftoken=pFqFiRMM7TJ6DZhufBEUaXzpmM3ZUVkgKwu9Ev9PsRk5j9WbIWkVWzMghHzQYbR0; sessionid=gx35b3ro68x55vcywvbifb1y83azebch",
+    "sessionUpdated": "2026-09-12T10:27:49.222Z"
   },
   "runtime": {
     "sampleBytes": 0,

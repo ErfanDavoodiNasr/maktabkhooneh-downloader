@@ -54,6 +54,9 @@ describe('parseArgv', () => {
         assert.ok(r.selectedLessons.has(3));
         assert.equal(r.isDryRun, true);
         assert.equal(r.isVerboseLoggingEnabled, true);
+        assert.equal(r.jobs, 1);
+        assert.equal(r.outputDir, null);
+        assert.equal(r.schedule, null);
     });
 
     it('parses --sample-bytes strictly', () => {
@@ -61,6 +64,41 @@ describe('parseArgv', () => {
         assert.equal(parseArgv(['--sample-bytes=0']).sampleBytesToDownload, 0);
         assert.throws(() => parseArgv(['--sample-bytes', '1.5']), /sample-bytes/);
         assert.throws(() => parseArgv(['--sample-bytes']), /Missing value/);
+    });
+
+    it('parses -j/--jobs and rejects invalid', () => {
+        assert.equal(parseArgv(['-j', '4']).jobs, 4);
+        assert.equal(parseArgv(['--jobs=2']).jobs, 2);
+        assert.equal(parseArgv(['-j4']).jobs, 4);
+        assert.throws(() => parseArgv(['-j', '0']), /must be > 0/);
+        assert.throws(() => parseArgv(['--jobs=-1']), /Invalid/);
+        assert.throws(() => parseArgv(['-j', 'abc']), /Invalid/);
+        assert.throws(() => parseArgv(['-j']), /Missing value/);
+        assert.throws(() => parseArgv(['-j', '999']), /max/);
+        assert.throws(() => parseArgv(['-j', '-1']), /Missing value/);
+    });
+
+    it('parses -o/--output-dir', () => {
+        assert.equal(parseArgv(['-o', './downloads']).outputDir, './downloads');
+        assert.equal(parseArgv(['--output-dir=/tmp/out']).outputDir, '/tmp/out');
+        assert.throws(() => parseArgv(['-o']), /Missing value/);
+    });
+
+    it('parses schedule flags', () => {
+        const r = parseArgv([
+            '--start-time', '02:00',
+            '--stop-time', '07:00',
+            '--timezone', 'Asia/Tehran',
+            '--no-wait'
+        ]);
+        assert.equal(r.schedule.mode, 'daily');
+        assert.equal(r.noWait, true);
+        assert.throws(() => parseArgv(['--start-at', '2026-01-01T00:00:00Z']), /both/);
+        assert.throws(() => parseArgv([
+            '--start-at', '2026-01-01T00:00:00Z',
+            '--stop-at', '2026-01-01T01:00:00Z',
+            '--start-time', '02:00'
+        ]), /mix/);
     });
 
     it('rejects unknown options', () => {

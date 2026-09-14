@@ -60,6 +60,7 @@ import {
     isUnitLocked,
     isVideoLecture,
     pickBestVideoUrl,
+    planLectures,
     unitIdOf
 } from './lib/course-parse.mjs';
 import {
@@ -67,6 +68,10 @@ import {
     downloadToFile as engineDownloadToFile,
     probeRemoteSize
 } from './lib/download-engine.mjs';
+import {ensureOutputDirectory, resolveCourseOutputRoot} from './lib/output.mjs';
+import {mapPool} from './lib/pool.mjs';
+import {createScheduleGate, ScheduleError, waitUntilAllowed} from './lib/schedule.mjs';
+import {EXIT} from './lib/exit-codes.mjs';
 
 // ===============
 // Console styling (ANSI colors) and emojis
@@ -284,11 +289,21 @@ function printUsage() {
     console.log(`  ${paintGreen('--sample-bytes')} ${paintYellow('N')}            Download only the first N bytes of each video`);
     console.log(`  ${paintGreen('--chapter')} ${paintYellow('SPEC')}           Select chapter(s): e.g. 2 or 1,3 or 2-4`);
     console.log(`  ${paintGreen('--lesson')} ${paintYellow('SPEC')}            Select lesson(s) inside selected chapter(s): e.g. 2 or 2-5,9`);
+    console.log(`  ${paintGreen('-j')} | ${paintGreen('--jobs')} ${paintYellow('N')}             Concurrent downloads (default: 1, max: 32)`);
+    console.log(`  ${paintGreen('-o')} | ${paintGreen('--output-dir')} ${paintYellow('PATH')}   Output parent directory (default: ./download)`);
+    console.log(`  ${paintGreen('--start-at')} ${paintYellow('ISO')}            One-time window start (timezone required, e.g. ...+03:30)`);
+    console.log(`  ${paintGreen('--stop-at')} ${paintYellow('ISO')}             One-time window stop (exclusive)`);
+    console.log(`  ${paintGreen('--start-time')} ${paintYellow('HH:MM[:SS]')}    Daily window start`);
+    console.log(`  ${paintGreen('--stop-time')} ${paintYellow('HH:MM[:SS]')}     Daily window stop (exclusive)`);
+    console.log(`  ${paintGreen('--timezone')} ${paintYellow('IANA')}          Timezone for daily windows (e.g. Asia/Tehran)`);
+    console.log(`  ${paintGreen('--no-wait')}                   Exit when outside the schedule window (do not sleep)`);
     console.log(`  ${paintGreen('--dry-run')}                   Preview files and estimated sizes without downloading`);
     console.log(`  ${paintGreen('--config')} ${paintYellow('<FILE>')}           Config file path (default: config.json)`);
     console.log(`  ${paintGreen('--force-login')}               Force fresh login even if stored session is valid`);
+    console.log(`  ${paintGreen('--quiet')} | ${paintGreen('-q')}                Less progress noise (still prints errors/summary)`);
     console.log(`  ${paintGreen('--verbose')} | ${paintGreen('-v')}              Verbose debug / HTTP flow info`);
     console.log(`  ${paintGreen('--help')} | ${paintGreen('-h')}                 Show this help and exit`);
+    console.log(`  ${paintGreen('--version')}                   Print version and exit`);
     console.log('\n' + paintBold('Config (config.json):'));
     console.log(`    auth.email / auth.password   Login credentials`);
     console.log(`    auth.cookie / auth.cookieFile Manual cookie override`);
@@ -298,11 +313,16 @@ function printUsage() {
     console.log(`    runtime.readTimeoutMs        Read timeout in ms`);
     console.log(`    course.baseUrl                   Base URL for slug input`);
     console.log(`    defaults.chapter / defaults.lesson / defaults.dryRun`);
+    console.log('\n' + paintBold('Exit codes:'));
+    console.log(`  0 success | 1 failure/partial | 2 usage/config | 130 interrupted`);
 
     // Examples
     console.log('\n' + paintBold('Examples:'));
     console.log('  ' + paintCyan('node download.mjs "<slug>"'));
     console.log('  ' + paintCyan('node download.mjs "https://maktabkhooneh.org/lms/course/<slug>/unit/<unit_id>/"'));
+    console.log('  ' + paintCyan('node download.mjs "<slug>" -j 4 -o ./downloads'));
+    console.log('  ' + paintCyan('node download.mjs "<slug>" --start-time 02:00 --stop-time 07:00 --timezone Asia/Tehran'));
+    console.log('  ' + paintCyan('node download.mjs "<slug>" --start-at 2026-09-15T02:00:00+03:30 --stop-at 2026-09-15T07:00:00+03:30'));
     console.log('  ' + paintCyan('node download.mjs "<slug>" --sample-bytes 65536 --verbose'));
     console.log('  ' + paintCyan('node download.mjs "<slug>" --dry-run'));
     console.log('  ' + paintCyan('node download.mjs "<slug>" --chapter 2 --lesson 2-5,9'));
@@ -320,11 +340,24 @@ function parseCLI(config = {}, configPath = DEFAULT_CONFIG_FILE) {
         chapter: config.chapter ?? null,
         lesson: config.lesson ?? null,
         forceLogin: !!config.forceLogin,
-        configPath
+        configPath,
+        jobs: config.jobs ?? 1,
+        outputDir: config.outputDir ?? null,
+        startAt: config.startAt ?? null,
+        stopAt: config.stopAt ?? null,
+        startTime: config.startTime ?? null,
+        stopTime: config.stopTime ?? null,
+        timezone: config.timezone ?? null,
+        noWait: !!config.noWait,
+        quiet: !!config.quiet
     });
     if (parsed.help) {
         printUsage();
-        process.exit(0);
+        process.exit(EXIT.SUCCESS);
+    }
+    if (parsed.version) {
+        console.log('1.1.0');
+        process.exit(EXIT.SUCCESS);
     }
     return {
         inputCourseRef: parsed.inputCourseRef,
@@ -334,7 +367,11 @@ function parseCLI(config = {}, configPath = DEFAULT_CONFIG_FILE) {
         forceLogin: parsed.forceLogin,
         selectedChapters: parsed.selectedChapters,
         selectedLessons: parsed.selectedLessons,
-        configPath: parsed.configPath || configPath
+        configPath: parsed.configPath || configPath,
+        jobs: parsed.jobs,
+        outputDir: parsed.outputDir,
+        schedule: parsed.schedule,
+        quiet: parsed.quiet
     };
 }
 
@@ -1021,8 +1058,13 @@ function extractSubtitleLinks(html) {
 }
 
 // Download a URL to a file via hardened streaming engine (auth cookies origin-scoped).
-async function downloadToFile(url, filePath, referer, maxRetries = RUNTIME_CONFIG.retryAttempts, sampleBytes = 0, label = '', expectedKind = 'video', outputRoot = null) {
-    const isTTY = process.stdout.isTTY;
+async function downloadToFile(url, filePath, referer, maxRetries = RUNTIME_CONFIG.retryAttempts, sampleBytes = 0, label = '', expectedKind = 'video', outputRoot = null, {
+    signal = null,
+    scheduleGate = null,
+    quiet = false,
+    concurrent = false
+} = {}) {
+    const isTTY = process.stdout.isTTY && !quiet && !concurrent;
     const truncate = (s, max = 70) => {
         if (!s) return '';
         const str = stripControlChars(String(s));
@@ -1053,7 +1095,9 @@ async function downloadToFile(url, filePath, referer, maxRetries = RUNTIME_CONFI
                 readTimeoutMs: RUNTIME_CONFIG.readTimeoutMs,
                 onWarn: (m) => logWarn(m),
                 onProgress: (ratio, got, total, name) => render(ratio, got, total, name || label),
-                fetchFn: async (u, init, timeoutMs) => fetchWithTimeout(u, init, timeoutMs)
+                fetchFn: async (u, init, timeoutMs) => fetchWithTimeout(u, init, timeoutMs),
+                signal,
+                scheduleGate
             }
         });
         if (isTTY) process.stdout.write('\n');
@@ -1108,7 +1152,11 @@ async function main() {
         isDryRun,
         forceLogin,
         selectedChapters,
-        selectedLessons
+        selectedLessons,
+        jobs,
+        outputDir,
+        schedule,
+        quiet
     } = parseCLI(parserDefaults, configPath);
     LOGIN_EMAIL = String(authCfg.email || '').trim();
     LOGIN_PASSWORD = String(authCfg.password || '').trim();
@@ -1129,7 +1177,7 @@ async function main() {
     const {verbose} = createVerboseLogger(isVerboseLoggingEnabled);
     if (!inputCourseRef) {
         printUsage();
-        process.exit(1);
+        process.exit(EXIT.USAGE);
     }
     let baseUrl;
     try {
@@ -1163,6 +1211,76 @@ async function main() {
     const courseSlug = extractCourseSlug(normalizedCourseUrl);
     const courseId = extractCourseIdFromSlug(courseSlug);
     const urlIsLmsFormat = /\/lms\/course\//.test(normalizedCourseUrl);
+
+    // Validate output path before any network I/O
+    const courseDisplayName = normalizeCourseFolderNameFromSlug(courseSlug);
+    let outputRootFolder;
+    try {
+        ({outputRoot: outputRootFolder} = resolveCourseOutputRoot({
+            outputDir,
+            courseDisplayName,
+            cwd: process.cwd()
+        }));
+    } catch (e) {
+        logError(String(e.message || e));
+        process.exit(EXIT.USAGE);
+    }
+
+    const runAbort = new AbortController();
+    let interrupted = false;
+    const onInterrupt = () => {
+        if (interrupted) return;
+        interrupted = true;
+        logWarn('Interrupt received — stopping new work and cancelling active downloads...');
+        try {
+            runAbort.abort();
+        } catch {
+            // ignore
+        }
+    };
+    process.once('SIGINT', onInterrupt);
+    process.once('SIGTERM', onInterrupt);
+
+    const scheduleGate = createScheduleGate(schedule, {
+        onStatus: (st) => {
+            if (quiet && st.phase === 'active') return;
+            if (st.phase === 'waiting_start' || st.phase === 'waiting_daily') {
+                logInfo(st.message);
+            } else if (st.phase === 'stopping') {
+                logWarn(`Schedule boundary: ${st.message}`);
+            } else if (st.phase === 'active' && schedule) {
+                logInfo(st.message);
+            }
+        }
+    });
+
+    // Schedule gate before login / metadata / downloads (no intentional HTTP outside window)
+    try {
+        await waitUntilAllowed(schedule, {
+            signal: runAbort.signal,
+            onStatus: (st) => {
+                if (st.phase === 'waiting_start' || st.phase === 'waiting_daily') logInfo(st.message);
+                else if (st.phase === 'active' && schedule) logInfo(st.message);
+            }
+        });
+    } catch (e) {
+        if (e?.code === 'INTERRUPTED' || interrupted) {
+            logWarn('Interrupted while waiting for schedule window');
+            process.exit(EXIT.INTERRUPTED);
+        }
+        if (e instanceof ScheduleError || e?.name === 'ScheduleError') {
+            logError(buildActionableError(
+                e.code || 'SCHEDULE',
+                e.message,
+                schedule?.noWait
+                    ? 'Omit --no-wait to wait for the next window, or adjust the schedule flags.'
+                    : 'Fix schedule flags, or omit them to run immediately.'
+            ));
+            process.exit(EXIT.USAGE);
+        }
+        throw e;
+    }
+
     // Attempt to load / create / verify session (may already return core)
     const prep = await prepareSession({
         userEmail,
@@ -1175,14 +1293,13 @@ async function main() {
     });
     ensureCookiePresent();
 
-    // Build a cleaner course folder name: remove trailing mk id and replace dashes with spaces.
-    const courseDisplayName = normalizeCourseFolderNameFromSlug(courseSlug);
-    const outputRootFolder = path.resolve(process.cwd(), 'download', courseDisplayName);
-    // Ensure base output folder exists only for real downloads
+    // Ensure base output folder exists only for real downloads (after auth)
     if (!isDryRun) {
         try {
-            await fs.promises.mkdir(outputRootFolder, {recursive: true});
-        } catch {
+            await ensureOutputDirectory(outputRootFolder);
+        } catch (e) {
+            logError(String(e.message || e));
+            process.exit(EXIT.FAILURE);
         }
     }
 
@@ -1218,6 +1335,11 @@ async function main() {
 
     console.log(`📚 Course slug: ${paintBold(decodeURIComponent(courseSlug))}`);
     console.log(`📁 Output folder: ${paintCyan(outputRootFolder)}`);
+    if (jobs > 1) console.log(`⚙️ Jobs: ${paintBold(String(jobs))}`);
+    if (schedule) {
+        const mode = schedule.mode === 'once' ? 'one-time' : `daily (${schedule.timezone})`;
+        console.log(`🗓️ Schedule: ${paintCyan(mode)}`);
+    }
     if (sampleBytesToDownload && sampleBytesToDownload > 0) {
         console.log(`🎯 Sample mode: downloading first ${paintBold(String(sampleBytesToDownload))} bytes of each video (saved as .sample.mp4)`);
     }
@@ -1398,153 +1520,248 @@ async function main() {
         return;
     }
 
-    // Iterate chapters and units
-    let totalUnits = 0, downloadedCount = 0, skippedCount = 0, failedCount = 0, nonLectureUnits = 0;
-    try {
-        for (let chapterIndex = 0; chapterIndex < chapters.length; chapterIndex++) {
-            const chapter = chapters[chapterIndex];
-            const chapterNo = chapterIndex + 1;
-            if (selectedChapters && !selectedChapters.has(chapterNo)) continue;
-            const chapterFolderName = `فصل ${chapterNo} - ${sanitizeName(chapter.title || chapter.slug || 'chapter')}`;
-            const chapterFolder = path.join(outputRootFolder, chapterFolderName);
-            assertOutputPathSafe(outputRootFolder, chapterFolder);
-            console.log(`📖 Chapter ${chapterIndex + 1}/${chapters.length}: ${paintBold(chapter.title || chapter.slug)}`);
+    // Iterate chapters and units (plan first, then bounded concurrent workers)
+    let totalUnits = 0, downloadedCount = 0, skippedCount = 0, failedCount = 0, cancelledCount = 0, deferredCount = 0,
+        nonLectureUnits = 0;
+    const planned = planLectures(chapters, {selectedChapters, selectedLessons});
+    // Count non-video units for messaging (same as before)
+    for (const chapter of chapters) {
+        for (const unit of getChapterUnits(chapter)) {
+            if (!isUnitActive(unit)) continue;
+            if (!isVideoLecture(unit)) nonLectureUnits++;
+        }
+    }
 
-            const units = getChapterUnits(chapter);
-            let chapterLectureNo = 0;
-            for (let unitIndex = 0; unitIndex < units.length; unitIndex++) {
-                const unit = units[unitIndex];
-                if (!isUnitActive(unit)) continue;
-                if (!isVideoLecture(unit)) {
-                    nonLectureUnits++;
-                    continue;
-                }
-                chapterLectureNo++;
-                if (selectedLessons && !selectedLessons.has(chapterLectureNo)) continue;
-                totalUnits++;
-                const unitNo = chapterLectureNo;
-                const baseFileName = `قسمت ${unitNo} - ${sanitizeName(unit.title || unit.slug || 'lecture')}.mp4`;
-                const finalFileName = (sampleBytesToDownload && sampleBytesToDownload > 0)
-                    ? baseFileName.replace(/\.mp4$/i, '.sample.mp4')
-                    : baseFileName;
-                const outputFilePath = path.join(chapterFolder, finalFileName);
-                verbose(`  🎬 Unit ${unitIndex + 1}/${units.length}: ${unit.title || unit.slug}`);
+    // Deduplicate by unit id or stable output path key
+    const seenKeys = new Set();
+    const jobsList = [];
+    for (const item of planned) {
+        const chapterFolderName = `فصل ${item.chapterNo} - ${sanitizeName(item.chapter.title || item.chapter.slug || 'chapter')}`;
+        const chapterFolder = path.join(outputRootFolder, chapterFolderName);
+        assertOutputPathSafe(outputRootFolder, chapterFolder);
+        const baseFileName = `قسمت ${item.lessonNo} - ${sanitizeName(item.unit.title || item.unit.slug || 'lecture')}.mp4`;
+        const finalFileName = (sampleBytesToDownload && sampleBytesToDownload > 0)
+            ? baseFileName.replace(/\.mp4$/i, '.sample.mp4')
+            : baseFileName;
+        const key = item.unitId != null ? `id:${item.unitId}` : `path:${chapterFolder}/${finalFileName}`;
+        if (seenKeys.has(key)) continue;
+        seenKeys.add(key);
+        jobsList.push({
+            ...item,
+            chapterFolder,
+            finalFileName,
+            outputFilePath: path.join(chapterFolder, finalFileName),
+            lectureUrl: buildLectureUrl(courseSlug, item.chapter, item.unit)
+        });
+    }
+    totalUnits = jobsList.length;
 
-                if (isUnitLocked(unit)) {
-                    logWarn(`🔒 Locked/No access: ${finalFileName}`);
-                    skippedCount++;
-                    continue;
-                }
+    const dlOpts = {
+        signal: runAbort.signal,
+        scheduleGate,
+        quiet,
+        concurrent: jobs > 1
+    };
 
-                const lectureUrl = buildLectureUrl(courseSlug, chapter, unit);
-                try {
-                    const media = await resolveUnitMedia(unit, {lectureUrl, referer: normalizedCourseUrl});
-                    const bestSourceUrl = media.bestSourceUrl;
-                    if (!bestSourceUrl) {
-                        logWarn(`No video source found for: ${finalFileName}`);
-                        skippedCount++;
-                        continue;
-                    }
+    async function processLectureJob(job) {
+        if (runAbort.signal.aborted) {
+            cancelledCount++;
+            return 'cancelled';
+        }
+        try {
+            scheduleGate.assertAllowed();
+        } catch {
+            deferredCount++;
+            return 'deferred';
+        }
 
-                    // Print the filename on its own line; progress bar will render on the next line
-                    console.log(`📥 Downloading: ${finalFileName}`);
-                    const status = await downloadToFile(bestSourceUrl, outputFilePath, lectureUrl, RUNTIME_CONFIG.retryAttempts, sampleBytesToDownload, '', 'video', outputRootFolder);
-                    if (status === 'exists') {
-                        console.log(paintYellow(`🟡 SKIP exists: ${finalFileName}`));
-                        skippedCount++;
-                    } else {
-                        logSuccess(`DOWNLOADED: ${finalFileName}`);
-                        downloadedCount++;
-                    }
+        if (job.locked) {
+            logWarn(`🔒 Locked/No access: ${job.finalFileName}`);
+            skippedCount++;
+            return 'skipped';
+        }
 
-                    // ---- Subtitles (download beside video, same base name) ----
-                    try {
-                        if (media.subtitleLinks.length > 0) {
-                            const videoBaseNoExt = finalFileName.replace(/\.sample\.mp4$/i, '').replace(/\.mp4$/i, '');
-                            for (const sUrl of media.subtitleLinks) {
-                                try {
-                                    let ext = '.vtt';
-                                    let absUrl = sUrl;
-                                    if (media.captionNeedsFileParam) {
-                                        const subtitleName = `${videoBaseNoExt}.vtt`;
-                                        absUrl = withCaptionFileParam(sUrl, subtitleName);
-                                    } else {
-                                        absUrl = toAbsoluteUrl(sUrl, ORIGIN);
-                                        try {
-                                            const up = new URL(absUrl);
-                                            ext = path.extname(up.pathname) || '.vtt';
-                                        } catch {
-                                        }
-                                    }
-                                    const subtitleName = `${videoBaseNoExt}${ext}`;
-                                    const subtitlePath = path.join(chapterFolder, subtitleName);
-                                    if (fs.existsSync(subtitlePath) && fs.statSync(subtitlePath).size > 0) {
-                                        console.log(paintYellow(`🟡 Subtitle exists: ${subtitleName}`));
-                                        continue;
-                                    }
-                                    console.log(`📝 Subtitle: ${subtitleName}`);
-                                    const sStatus = await downloadToFile(absUrl, subtitlePath, lectureUrl, RUNTIME_CONFIG.retryAttempts, 0, '', 'subtitle', outputRootFolder);
-                                    if (sStatus === 'exists') console.log(paintYellow(`🟡 Subtitle exists: ${subtitleName}`));
-                                    else logSuccess(`SUBTITLE: ${subtitleName}`);
-                                    await sleep(150);
-                                } catch (subErr) {
-                                    logWarn(`Subtitle fail: ${subErr.message}`);
-                                }
-                            }
-                        }
-                    } catch (subOuter) {
-                        logWarn(`Subtitle parse error: ${subOuter.message}`);
-                    }
-
-                    // ---- Attachments (download beside video) ----
-                    try {
-                        if (media.attachmentLinks.length > 0) {
-                            const videoBaseNoExt = finalFileName.replace(/\.sample\.mp4$/i, '').replace(/\.mp4$/i, '');
-                            for (const attUrl of media.attachmentLinks) {
-                                try {
-                                    let filePart;
-                                    try {
-                                        const u = new URL(attUrl);
-                                        filePart = u.pathname.split('/').pop() || 'attachment.bin';
-                                    } catch {
-                                        filePart = attUrl.split('?')[0].split('/').pop() || 'attachment.bin';
-                                    }
-                                    const sanitizedAttachment = sanitizeContentDispositionFilename(filePart, 'attachment.bin');
-                                    const finalAttachmentName = `${videoBaseNoExt} - ${sanitizedAttachment}`;
-                                    const attachmentPath = path.join(chapterFolder, finalAttachmentName);
-                                    assertOutputPathSafe(outputRootFolder, attachmentPath);
-                                    if (fs.existsSync(attachmentPath) && fs.statSync(attachmentPath).size > 0) {
-                                        console.log(paintYellow(`🟡 Attachment exists: ${finalAttachmentName}`));
-                                        continue;
-                                    }
-                                    console.log(`📎 Attachment: ${finalAttachmentName}`);
-                                    const aStatus = await downloadToFile(attUrl, attachmentPath, lectureUrl, RUNTIME_CONFIG.retryAttempts, 0, '', 'attachment', outputRootFolder);
-                                    if (aStatus === 'exists') console.log(paintYellow(`🟡 Attachment exists: ${finalAttachmentName}`));
-                                    else logSuccess(`ATTACHMENT: ${finalAttachmentName}`);
-                                    await sleep(200);
-                                } catch (attErr) {
-                                    logWarn(`Attachment fail: ${attErr.message}`);
-                                }
-                            }
-                        }
-                    } catch (attOuterErr) {
-                        logWarn(`Attachment parse error: ${attOuterErr.message}`);
-                    }
-                    // polite pause
-                    await sleep(400);
-                } catch (err) {
-                    logError(`FAIL ${finalFileName}: ${err.message}`);
-                    failedCount++;
-                }
+        try {
+            await fs.promises.mkdir(job.chapterFolder, {recursive: true});
+            const media = await resolveUnitMedia(job.unit, {lectureUrl: job.lectureUrl, referer: normalizedCourseUrl});
+            const bestSourceUrl = media.bestSourceUrl;
+            if (!bestSourceUrl) {
+                logWarn(`No video source found for: ${job.finalFileName}`);
+                skippedCount++;
+                return 'skipped';
             }
+
+            if (!quiet) console.log(`📥 Downloading: ${job.finalFileName}`);
+            const status = await downloadToFile(
+                bestSourceUrl,
+                job.outputFilePath,
+                job.lectureUrl,
+                RUNTIME_CONFIG.retryAttempts,
+                sampleBytesToDownload,
+                '',
+                'video',
+                outputRootFolder,
+                dlOpts
+            );
+            if (status === 'exists') {
+                console.log(paintYellow(`🟡 SKIP exists: ${job.finalFileName}`));
+                skippedCount++;
+            } else if (status === 'deferred') {
+                logWarn(`Deferred (schedule window): ${job.finalFileName}`);
+                deferredCount++;
+                return 'deferred';
+            } else {
+                logSuccess(`DOWNLOADED: ${job.finalFileName}`);
+                downloadedCount++;
+            }
+
+            // ---- Subtitles ----
+            try {
+                if (media.subtitleLinks.length > 0) {
+                    const videoBaseNoExt = job.finalFileName.replace(/\.sample\.mp4$/i, '').replace(/\.mp4$/i, '');
+                    for (const sUrl of media.subtitleLinks) {
+                        try {
+                            scheduleGate.assertAllowed();
+                            let ext = '.vtt';
+                            let absUrl = sUrl;
+                            if (media.captionNeedsFileParam) {
+                                const subtitleName = `${videoBaseNoExt}.vtt`;
+                                absUrl = withCaptionFileParam(sUrl, subtitleName);
+                            } else {
+                                absUrl = toAbsoluteUrl(sUrl, ORIGIN);
+                                try {
+                                    const up = new URL(absUrl);
+                                    ext = path.extname(up.pathname) || '.vtt';
+                                } catch {
+                                }
+                            }
+                            const subtitleName = `${videoBaseNoExt}${ext}`;
+                            const subtitlePath = path.join(job.chapterFolder, subtitleName);
+                            if (fs.existsSync(subtitlePath) && fs.statSync(subtitlePath).size > 0) {
+                                console.log(paintYellow(`🟡 Subtitle exists: ${subtitleName}`));
+                                continue;
+                            }
+                            if (!quiet) console.log(`📝 Subtitle: ${subtitleName}`);
+                            const sStatus = await downloadToFile(absUrl, subtitlePath, job.lectureUrl, RUNTIME_CONFIG.retryAttempts, 0, '', 'subtitle', outputRootFolder, dlOpts);
+                            if (sStatus === 'deferred') {
+                                deferredCount++;
+                                return 'deferred';
+                            }
+                            if (sStatus === 'exists') console.log(paintYellow(`🟡 Subtitle exists: ${subtitleName}`));
+                            else logSuccess(`SUBTITLE: ${subtitleName}`);
+                            if (jobs === 1) await sleep(150);
+                        } catch (subErr) {
+                            if (subErr?.code === 'INTERRUPTED' || /cancelled/i.test(String(subErr?.message || ''))) throw subErr;
+                            logWarn(`Subtitle fail: ${subErr.message}`);
+                        }
+                    }
+                }
+            } catch (subOuter) {
+                if (subOuter?.code === 'INTERRUPTED' || /cancelled/i.test(String(subOuter?.message || ''))) throw subOuter;
+                logWarn(`Subtitle parse error: ${subOuter.message}`);
+            }
+
+            // ---- Attachments ----
+            try {
+                if (media.attachmentLinks.length > 0) {
+                    const videoBaseNoExt = job.finalFileName.replace(/\.sample\.mp4$/i, '').replace(/\.mp4$/i, '');
+                    for (const attUrl of media.attachmentLinks) {
+                        try {
+                            scheduleGate.assertAllowed();
+                            let filePart;
+                            try {
+                                const u = new URL(attUrl);
+                                filePart = u.pathname.split('/').pop() || 'attachment.bin';
+                            } catch {
+                                filePart = attUrl.split('?')[0].split('/').pop() || 'attachment.bin';
+                            }
+                            const sanitizedAttachment = sanitizeContentDispositionFilename(filePart, 'attachment.bin');
+                            const finalAttachmentName = `${videoBaseNoExt} - ${sanitizedAttachment}`;
+                            const attachmentPath = path.join(job.chapterFolder, finalAttachmentName);
+                            assertOutputPathSafe(outputRootFolder, attachmentPath);
+                            if (fs.existsSync(attachmentPath) && fs.statSync(attachmentPath).size > 0) {
+                                console.log(paintYellow(`🟡 Attachment exists: ${finalAttachmentName}`));
+                                continue;
+                            }
+                            if (!quiet) console.log(`📎 Attachment: ${finalAttachmentName}`);
+                            const aStatus = await downloadToFile(attUrl, attachmentPath, job.lectureUrl, RUNTIME_CONFIG.retryAttempts, 0, '', 'attachment', outputRootFolder, dlOpts);
+                            if (aStatus === 'deferred') {
+                                deferredCount++;
+                                return 'deferred';
+                            }
+                            if (aStatus === 'exists') console.log(paintYellow(`🟡 Attachment exists: ${finalAttachmentName}`));
+                            else logSuccess(`ATTACHMENT: ${finalAttachmentName}`);
+                            if (jobs === 1) await sleep(200);
+                        } catch (attErr) {
+                            if (attErr?.code === 'INTERRUPTED' || /cancelled/i.test(String(attErr?.message || ''))) throw attErr;
+                            logWarn(`Attachment fail: ${attErr.message}`);
+                        }
+                    }
+                }
+            } catch (attOuterErr) {
+                if (attOuterErr?.code === 'INTERRUPTED' || /cancelled/i.test(String(attOuterErr?.message || ''))) throw attOuterErr;
+                logWarn(`Attachment parse error: ${attOuterErr.message}`);
+            }
+            if (jobs === 1) await sleep(400);
+            return 'ok';
+        } catch (err) {
+            if (err?.code === 'SCHEDULE_STOP' || err?.deferred) {
+                deferredCount++;
+                return 'deferred';
+            }
+            if (err?.code === 'INTERRUPTED' || /cancelled/i.test(String(err?.message || '')) || runAbort.signal.aborted) {
+                cancelledCount++;
+                return 'cancelled';
+            }
+            logError(`FAIL ${job.finalFileName}: ${err.message}`);
+            failedCount++;
+            return 'failed';
+        }
+    }
+
+    try {
+        // Group log by chapter for readability when sequential; concurrent still processes all jobs
+        if (jobs === 1) {
+            let lastChapter = null;
+            for (const job of jobsList) {
+                if (interrupted || runAbort.signal.aborted) {
+                    cancelledCount += 1;
+                    continue;
+                }
+                if (job.chapterNo !== lastChapter) {
+                    lastChapter = job.chapterNo;
+                    console.log(`📖 Chapter ${job.chapterNo}/${chapters.length}: ${paintBold(job.chapter.title || job.chapter.slug)}`);
+                }
+                await processLectureJob(job);
+            }
+        } else {
+            const byChapter = new Map();
+            for (const job of jobsList) {
+                if (!byChapter.has(job.chapterNo)) byChapter.set(job.chapterNo, job.chapter);
+            }
+            for (const [no, ch] of byChapter) {
+                console.log(`📖 Chapter ${no}/${chapters.length}: ${paintBold(ch.title || ch.slug)}`);
+            }
+            await mapPool(jobsList, jobs, processLectureJob, {signal: runAbort.signal});
         }
     } finally {
+        process.off('SIGINT', onInterrupt);
+        process.off('SIGTERM', onInterrupt);
         console.log('—'.repeat(40));
         console.log(`📊 Total lecture units: ${paintBold(String(totalUnits))}`);
         console.log(`✅ Downloaded: ${paintGreen(String(downloadedCount))}`);
         console.log(`🟡 Skipped: ${paintYellow(String(skippedCount))}`);
+        console.log(`⏸️ Deferred: ${paintYellow(String(deferredCount))}`);
+        console.log(`⛔ Cancelled: ${paintYellow(String(cancelledCount))}`);
         console.log(`❌ Failed: ${paintRed(String(failedCount))}`);
-        if (failedCount > 0) process.exitCode = 1;
+        if (interrupted || runAbort.signal.aborted) {
+            process.exitCode = EXIT.INTERRUPTED;
+        } else if (failedCount > 0) {
+            process.exitCode = EXIT.FAILURE;
+        } else if (deferredCount > 0 && downloadedCount === 0 && skippedCount === 0) {
+            // Entire run deferred to next window — not a hard failure
+            process.exitCode = EXIT.SUCCESS;
+        }
         if (totalUnits === 0) {
             if (selectedChapters || selectedLessons) {
                 logError(buildActionableError(
@@ -1555,7 +1772,7 @@ async function main() {
                         'Omit filters to download the whole course, or widen the range.'
                     ]
                 ));
-                process.exitCode = 2;
+                process.exitCode = EXIT.USAGE;
             } else if (nonLectureUnits > 0) {
                 logInfo(`No downloadable video lectures found. This course appears to contain only non-video units (e.g. assignment/quiz).`);
             } else {
@@ -1566,13 +1783,14 @@ async function main() {
 }
 
 main().catch(err => {
-    if (/Invalid (range|number token|number)|Unknown option|Missing value|Invalid --/.test(String(err?.message || ''))) {
+    if (/Invalid (range|number token|number)|Unknown option|Missing value|Invalid --|Invalid -j|Invalid timezone|Invalid --start|Invalid --stop|Cannot mix|requires both|must be after|must differ|empty daily|max \d+/.test(String(err?.message || '')) ||
+        err?.name === 'ScheduleError') {
         logError(buildActionableError(
-            'CLI_INPUT',
+            err?.code || 'CLI_INPUT',
             err.message,
-            'Examples: --chapter 2 | --chapter 1,3 | --chapter 2-4 | --lesson 2-5,9 | --sample-bytes 65536'
+            'See --help for jobs (-j), output (-o), and schedule flags.'
         ));
-        process.exit(2);
+        process.exit(EXIT.USAGE);
     }
     if (/Invalid (range|number token|number)/.test(String(err?.message || ''))) {
         logError(buildActionableError(
@@ -1580,17 +1798,21 @@ main().catch(err => {
             `Invalid --chapter/--lesson format: ${err.message}`,
             'Examples: --chapter 2 | --chapter 1,3 | --chapter 2-4 | --lesson 2-5,9'
         ));
-        process.exit(2);
+        process.exit(EXIT.USAGE);
+    }
+    if (err?.code === 'INTERRUPTED' || /interrupted/i.test(String(err?.message || ''))) {
+        logWarn(String(err.message || 'Interrupted'));
+        process.exit(EXIT.INTERRUPTED);
     }
     const rawMsg = redactSecrets(String(err?.message || err || ''), secretBag());
     if (/^\[[A-Z0-9_]+\]/.test(rawMsg) && rawMsg.includes('Next step:')) {
         logError(rawMsg);
-        process.exit(1);
+        process.exit(EXIT.FAILURE);
     }
     logError(buildActionableError(
         'FATAL',
         rawMsg,
         'Retry with --verbose to see more details.'
     ));
-    process.exit(1);
+    process.exit(EXIT.FAILURE);
 });
