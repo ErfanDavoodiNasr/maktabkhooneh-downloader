@@ -72,6 +72,8 @@ import {ensureOutputDirectory, resolveCourseOutputRoot} from './lib/output.mjs';
 import {mapPool} from './lib/pool.mjs';
 import {createScheduleGate, ScheduleError, waitUntilAllowed} from './lib/schedule.mjs';
 import {EXIT} from './lib/exit-codes.mjs';
+import {createSessionManager} from './lib/session-manager.mjs';
+import {createMetrics} from './lib/metrics.mjs';
 
 // ===============
 // Console styling (ANSI colors) and emojis
@@ -190,6 +192,10 @@ let LOGIN_PASSWORD = '';
 let COOKIE = 'PUT_YOUR_COOKIE_HERE';
 // ACTIVE_COOKIE will be dynamically set after login/session load (fallback to COOKIE)
 let ACTIVE_COOKIE = null;
+/** @type {ReturnType<typeof createSessionManager>|null} */
+let SESSION_MANAGER = null;
+/** @type {ReturnType<typeof createMetrics>|null} */
+let METRICS = null;
 // Sample mode default (0 means full download)
 const DEFAULT_SAMPLE_BYTES = 0;
 
@@ -398,14 +404,45 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 60_000) {
 async function fetchWithRetry(url, options = {}, {
     retries = RUNTIME_CONFIG.retryAttempts,
     timeoutMs = RUNTIME_CONFIG.requestTimeoutMs,
-    onRetry
+    onRetry,
+    allowAuthRecover = true
 } = {}) {
     let lastErr = null;
+    let authRecovered = false;
     for (let attempt = 1; attempt <= retries; attempt++) {
         try {
             const res = await fetchWithTimeout(url, options, timeoutMs);
+            if (allowAuthRecover && SESSION_MANAGER && !authRecovered &&
+                (res.status === 401 || res.status === 403)) {
+                let bodySnippet = '';
+                try {
+                    bodySnippet = (await res.clone().text()).slice(0, 512);
+                } catch {
+                    // ignore
+                }
+                const cls = SESSION_MANAGER.classify({
+                    status: res.status,
+                    location: res.headers.get('location'),
+                    bodySnippet,
+                    contentType: res.headers.get('content-type') || ''
+                });
+                if (cls.recoverable) {
+                    const seenGen = SESSION_MANAGER.getGeneration();
+                    await SESSION_MANAGER.recover({reason: cls.reason, seenGeneration: seenGen});
+                    authRecovered = true;
+                    const next = {...options, headers: {...(options.headers || {})}};
+                    if (next.headers && typeof next.headers === 'object') {
+                        const ck = ACTIVE_COOKIE || COOKIE;
+                        if (ck && ck !== 'PUT_YOUR_COOKIE_HERE') next.headers.cookie = ck;
+                    }
+                    options = next;
+                    attempt -= 1;
+                    continue;
+                }
+            }
             if (isRetriableStatus(res.status) && attempt < retries) {
                 if (typeof onRetry === 'function') onRetry({attempt, retries, reason: `HTTP ${res.status}`});
+                METRICS?.inc('retries');
                 await sleep(toBackoffMs(attempt));
                 continue;
             }
@@ -414,6 +451,7 @@ async function fetchWithRetry(url, options = {}, {
             lastErr = err;
             if (attempt < retries && isRetriableNetworkError(err)) {
                 if (typeof onRetry === 'function') onRetry({attempt, retries, reason: err.message || String(err)});
+                METRICS?.inc('retries');
                 await sleep(toBackoffMs(attempt));
                 continue;
             }
@@ -590,12 +628,12 @@ function withCaptionFileParam(captionUrl, subtitleName) {
 }
 
 // API: core-data to verify authentication and basic profile.
-async function fetchCoreData(referer) {
+async function fetchCoreData(referer, {allowAuthRecover = true} = {}) {
     const url = `${ORIGIN}/api/v1/general/core-data/?profile=1`;
     const res = await fetchWithRetry(url, {
         method: 'GET',
         headers: {...commonHeaders(referer || ORIGIN), accept: 'application/json'}
-    });
+    }, {allowAuthRecover});
     if (!res.ok) throw new Error(explainHttpFailure(res.status, 'Auth check (core-data)'));
     return res.json();
 }
@@ -1019,6 +1057,7 @@ async function prepareSession({userEmail, userPassword, verbose, courseUrl, forc
             if (ACTIVE_COOKIE) {
                 authCfg.sessionCookie = ACTIVE_COOKIE;
                 authCfg.sessionUpdated = new Date().toISOString();
+                authCfg.sessionGeneration = Number(authCfg.sessionGeneration || 0) + 1;
                 await persistConfig(configPath, config);
                 logSuccess('Login success; session saved to config.auth.sessionCookie');
             }
@@ -1097,7 +1136,9 @@ async function downloadToFile(url, filePath, referer, maxRetries = RUNTIME_CONFI
                 onProgress: (ratio, got, total, name) => render(ratio, got, total, name || label),
                 fetchFn: async (u, init, timeoutMs) => fetchWithTimeout(u, init, timeoutMs),
                 signal,
-                scheduleGate
+                scheduleGate,
+                getCookie: () => ACTIVE_COOKIE || COOKIE,
+                session: SESSION_MANAGER
             }
         });
         if (isTTY) process.stdout.write('\n');
@@ -1292,6 +1333,49 @@ async function main() {
         configPath
     });
     ensureCookiePresent();
+
+    METRICS = createMetrics();
+    SESSION_MANAGER = createSessionManager({
+        getCookie: () => ACTIVE_COOKIE || COOKIE,
+        setCookie: (ck) => {
+            ACTIVE_COOKIE = ck;
+        },
+        loginFn: async () => {
+            if (!(userEmail && userPassword)) {
+                throw new Error('Cannot re-login: auth.email/auth.password not configured');
+            }
+            await loginWithCredentialsInline(userEmail, userPassword, verbose);
+            if (!ACTIVE_COOKIE) throw new Error('Re-login produced no session cookie');
+            return ACTIVE_COOKIE;
+        },
+        validateFn: async (ck) => {
+            const prev = ACTIVE_COOKIE;
+            ACTIVE_COOKIE = ck;
+            try {
+                const core = await fetchCoreData(normalizedCourseUrl, {allowAuthRecover: false});
+                return !!core?.auth?.details?.is_authenticated;
+            } catch {
+                return false;
+            } finally {
+                ACTIVE_COOKIE = ck || prev;
+            }
+        }, persistFn: async (ck, generation) => {
+            const authCfg = (config.auth && typeof config.auth === 'object') ? config.auth : (config.auth = {});
+            // Generation fence: refuse to write if a newer session was already persisted
+            const prevGen = Number(authCfg.sessionGeneration) || 0;
+            if (generation < prevGen) return;
+            authCfg.sessionCookie = ck;
+            authCfg.sessionUpdated = new Date().toISOString();
+            authCfg.sessionGeneration = generation;
+            await persistConfig(configPath, config);
+        },
+        scheduleGate,
+        onInfo: (msg) => logInfo(msg),
+        onWarn: (msg) => logWarn(msg),
+        metrics: METRICS.raw,
+        cooldownMs: 5_000,
+        maxFailures: 3
+    });
 
     // Ensure base output folder exists only for real downloads (after auth)
     if (!isDryRun) {
@@ -1754,6 +1838,10 @@ async function main() {
         console.log(`⏸️ Deferred: ${paintYellow(String(deferredCount))}`);
         console.log(`⛔ Cancelled: ${paintYellow(String(cancelledCount))}`);
         console.log(`❌ Failed: ${paintRed(String(failedCount))}`);
+        if (METRICS && isVerboseLoggingEnabled) {
+            const snap = METRICS.snapshot();
+            verbose(`Metrics: authRecover=${snap.authRecoverOk}/${snap.authRecoverAttempts} reuse=${snap.authReuse} retries=${snap.retries} bytes=${snap.bytesDownloaded}`);
+        }
         if (interrupted || runAbort.signal.aborted) {
             process.exitCode = EXIT.INTERRUPTED;
         } else if (failedCount > 0) {
